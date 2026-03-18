@@ -1,0 +1,8 @@
+{
+  "id": "planning",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
