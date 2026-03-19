@@ -12,8 +12,10 @@
 - **会话感知卡片路由** — 通过 `message_received` 钩子捕获会话 ID，通知发送到正确的聊天（群聊或私聊）
 - **飞书互动卡片** — 可视化进度卡片，通过 PATCH 实时更新
 - **Telegram 消息** — 纯文本进度展示，通过 editMessage 实时更新
+- **子 agent 计划委托** — 子 agent 通过 `subagent_spawned` 钩子自动更新父 session 的计划和飞书/Telegram 卡片
+- **Spawn 拦截** — 在 agent 创建计划之前阻止 `sessions_spawn`，确保用户可见性和干净的取消流程
 - **确认拦截** — 当存在任何活跃计划时，自动拦截不必要的"要继续吗？"类确认消息
-- **子任务感知** — 当子 agent 失败时，通知父 session
+- **子 agent 失败感知** — 当子 agent 失败时，通知父 session
 
 ## 工作原理
 
@@ -28,6 +30,21 @@ Agent 收到任务
 ```
 
 支持同时维护多个活跃计划。每个计划通过标题标识——agent 使用相同标题更新已有计划，使用不同标题创建新的并发计划。每个计划拥有独立的进度卡片/消息。
+
+### 子 Agent 计划委托
+
+当 agent spawn 子 agent 时，插件自动委托计划所有权：
+
+```
+Agent 创建计划 → spawn 子 agent
+  → subagent_spawned 钩子将子 session 链接到父 session 的 planDir
+  → 子 agent 通过 before_prompt_build 看到父 session 的计划
+  → 子 agent 的 plan_write 更新父 session 的计划文件
+  → 飞书/Telegram 卡片被 PATCH（同一张卡片，不是新卡片）
+  → 父 session 恢复后可继续更新同一计划
+```
+
+Spawn 受到拦截：如果 agent 没有活跃计划，`sessions_spawn` 会被阻止，强制 agent 先创建计划。这确保用户始终有可见性，且可以干净地取消任务。
 
 ### 系统提示注入
 
@@ -121,7 +138,7 @@ Agent 收到任务
 
 ```
 src/
-├── index.ts              # 插件入口 — 注册工具 + 6 个钩子
+├── index.ts              # 插件入口 — 注册工具 + 8 个钩子
 ├── types.ts              # 核心类型：PlanFile、PlanItem、PlanStatus
 ├── plan-tool.ts          # plan_write 工具的 schema 和说明
 ├── plan-state.ts         # 磁盘 I/O：原子读写 .plan.json 文件
@@ -141,7 +158,7 @@ src/
 
 - **Telegram 仅纯文本** — 消息未使用 `parse_mode`，Markdown 格式不会被渲染
 - **子 agent 通知使用私有 API** — `enqueueSystemEvent` 不属于正式的 Plugin SDK，OpenClaw 升级后可能失效
-- **计划不跨 session 共享** — 每个 session 有独立的计划，子 agent 无法直接更新父 session 的计划
+- **委托要求相同 agentDir** — 子 agent 计划委托仅在父子共享同一 `agentDir` 时有效（同一 agent 的子 agent 默认满足）
 - **conversationId 可用性** — 卡片路由到群聊依赖 `message_received` 钩子上下文中的 `conversationId`；若不可用则回退到请求者私聊
 
 ## 环境要求

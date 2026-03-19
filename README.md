@@ -12,8 +12,10 @@ Structured task planning for OpenClaw agents. Keeps agents on track across tool 
 - **Conversation-aware card routing** — notifications are sent to the correct chat (group or DM) via `message_received` hook
 - **Feishu interactive cards** — visual progress cards with live PATCH updates
 - **Telegram messages** — plain-text progress with live edits
+- **Subagent plan delegation** — sub-agents automatically update the parent's plan and Feishu/Telegram card via `subagent_spawned` hook
+- **Spawn gating** — `sessions_spawn` is blocked until the agent creates a plan, ensuring user visibility and clean cancellation
 - **Confirmation interception** — suppresses unnecessary "shall I proceed?" messages when any active plan exists
-- **Subagent awareness** — pokes parent session when a sub-agent fails
+- **Subagent failure awareness** — pokes parent session when a sub-agent fails
 
 ## How It Works
 
@@ -28,6 +30,21 @@ Agent receives task
 ```
 
 Multiple plans can be active simultaneously. Each plan is identified by its title — the agent uses the same title to update an existing plan, or a different title to create a new concurrent plan. Each plan gets its own progress card/message.
+
+### Subagent Delegation
+
+When an agent spawns a sub-agent, the plugin automatically delegates plan ownership:
+
+```
+Agent creates plan → spawns sub-agent
+  → subagent_spawned hook links child to parent's planDir
+  → sub-agent sees parent's plan via before_prompt_build
+  → sub-agent's plan_write updates parent's plan file
+  → Feishu/Telegram card is PATCHed (same card, not a new one)
+  → parent resumes and can continue updating the same plan
+```
+
+Spawning is gated: `sessions_spawn` is blocked if the agent has no active plan, forcing the agent to create one first. This ensures the user always has visibility and can cancel cleanly.
 
 ### System Prompt Injection
 
@@ -121,7 +138,7 @@ Per-agent accounts are supported via `channels.telegram.accounts.{agentAccountId
 
 ```
 src/
-├── index.ts              # Plugin entry — registers tool + 6 hooks
+├── index.ts              # Plugin entry — registers tool + 8 hooks
 ├── types.ts              # Core types: PlanFile, PlanItem, PlanStatus
 ├── plan-tool.ts          # plan_write tool schema and description
 ├── plan-state.ts         # Disk I/O: atomic read/write of .plan.json files
@@ -141,7 +158,7 @@ Plan files are stored per-agent, per-session, per-plan:
 
 - **Telegram plain text only** — messages do not use `parse_mode`, so Markdown formatting is not rendered
 - **Subagent poke uses private API** — `enqueueSystemEvent` is not part of the formal Plugin SDK; may break on OpenClaw upgrades
-- **No cross-session plan sharing** — each session has its own plans; sub-agents cannot update the parent's plans directly
+- **Delegation requires same agentDir** — subagent plan delegation only works when parent and child share the same `agentDir` (true for same-agent subagents)
 - **ConversationId availability** — card routing to group chats depends on `conversationId` being present in the `message_received` hook context; if unavailable, falls back to requester DM
 
 ## Requirements
