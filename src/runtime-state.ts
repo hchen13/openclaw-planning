@@ -125,3 +125,29 @@ export function setAccountConversationId(accountId: string, conversationId: stri
 export function getAccountConversationId(accountId: string): string | undefined {
   return accountConversation.get(accountId);
 }
+
+// ── Plan delegation (subagent → parent plan) ──
+// When a subagent is spawned from a parent with active plans, the subagent
+// writes to the parent's planDir instead of its own. This gives the user
+// real-time visibility into subagent progress via the parent's Feishu/TG card.
+
+export interface PlanDelegation {
+  parentPlanDir: string;
+  parentSessionKey: string;
+  /** Channel of the original request (for card routing from subagent). */
+  messageChannel?: string;
+  /** Account ID of the agent (for Feishu/Telegram credential resolution). */
+  agentAccountId?: string;
+  /** Conversation ID (for card routing to correct chat). */
+  conversationId?: string;
+}
+
+const planDelegations = new Map<string, PlanDelegation>();
+
+export function setPlanDelegation(childSessionKey: string, delegation: PlanDelegation): void {
+  planDelegations.set(childSessionKey, delegation);
+}
+
+export function getPlanDelegation(childSessionKey: string): PlanDelegation | undefined {
+  return planDelegations.get(childSessionKey);
+}

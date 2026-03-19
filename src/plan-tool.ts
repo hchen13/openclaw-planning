@@ -37,7 +37,7 @@ export const PLAN_WRITE_DESCRIPTION = `Write or update the current task plan. Cr
 When to use:
 - Any multi-step task, including purely linear flows (read → analyze → output) — a plan keeps you on track through compaction and gives the user real-time visibility. Don't skip it because a task feels simple.
 - Tasks with ≥3 distinct phases or branching decisions
-- ALWAYS before spawning sub-agents — the user has zero visibility during a spawn. Write the full plan first (all phases of the task), then spawn. The sub-agent may complete every item, but the user needs to see the plan before the wait begins
+- ALWAYS before spawning sub-agents (sessions_spawn will be BLOCKED if no plan exists). Write the full plan first — break the task into items covering all phases, then spawn. The sub-agent will see and update your plan automatically
 
 When NOT to use:
 - Tasks completable in 1-3 tool calls
@@ -56,6 +56,7 @@ Best practices:
 - Pass the COMPLETE items array every time (full replacement, not incremental)
 - If you change item content or add/remove items (not just status), explain why in the \`message\` field
 - When ALL items are done, call plan_write one final time with all items marked completed to close the plan — then send your normal reply with the actual results
+- When the user cancels a task or tells you to stop, call plan_write immediately: mark remaining pending/in_progress items as "cancelled" and set the \`message\` field to explain why (e.g. "Cancelled by user"). Do NOT leave a plan in a stale state
 
 Multiple concurrent plans:
 - Each plan is identified by its title — use the EXACT same title to update an existing plan

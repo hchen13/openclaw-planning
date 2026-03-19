@@ -121,6 +121,26 @@ Workflow: ask all clarifying questions upfront (before the plan), then execute t
 }
 
 /**
+ * Build <plan_reminder> for delegated subagents — tells the subagent to update
+ * the parent's plan rather than creating its own.
+ */
+export function buildDelegatedPlanReminder(plans: PlanFile[], stale = false): string {
+  const sections = plans.map(buildSinglePlanSection).join("\n\n");
+
+  const staleWarning = stale
+    ? "\n⚠️ plan_write hasn't been called in a while. Update task statuses now."
+    : "";
+
+  return `<plan_reminder>
+You are a sub-agent. The parent task has active plans — update them using plan_write with the EXACT same title.
+
+${sections}${staleWarning}
+Mark items in_progress when starting, completed when done.
+Execute autonomously — do not stop to ask "shall I proceed?".
+</plan_reminder>`;
+}
+
+/**
  * Check if a plan has any active (non-terminal) items.
  */
 export function isPlanActive(plan: PlanFile): boolean {
