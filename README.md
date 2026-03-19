@@ -2,20 +2,36 @@
 
 # OpenClaw Planning Plugin
 
-Structured task planning for OpenClaw agents. Keeps agents on track across tool calls and context compaction, and gives users real-time visibility into what their agent is doing.
+**The problem:** When an AI agent runs a 20-step task on a messaging platform, the user stares at a blank chat for minutes. There's no progress bar, no status update, no way to know if the agent is stuck or just thinking. When the agent spawns sub-agents, it gets worse — the user has zero visibility into what might be a 10-minute background operation. And if context gets compacted mid-task, the agent forgets what it was doing.
 
-## Features
+**This plugin fixes that.** It gives agents a `plan_write` tool to create structured task plans. Each plan becomes a live-updating progress card in Feishu or Telegram. The plan is injected into the system prompt every turn, so the agent stays on track even through compaction. Sub-agents automatically update the parent's plan. Users can cancel cleanly because the plan is always visible.
 
-- **`plan_write` tool** — agents create and update task plans during multi-step work
-- **Multiple concurrent plans** — agents can track unrelated tasks in separate plans within the same session
-- **System prompt injection** — all active plan states are injected every turn (sparse/full/stale reminders, adaptive to recency)
-- **Conversation-aware card routing** — notifications are sent to the correct chat (group or DM) via `message_received` hook
-- **Feishu interactive cards** — visual progress cards with live PATCH updates
-- **Telegram messages** — plain-text progress with live edits
-- **Subagent plan delegation** — sub-agents automatically update the parent's plan and Feishu/Telegram card via `subagent_spawned` hook
-- **Spawn gating** — `sessions_spawn` is blocked until the agent creates a plan, ensuring user visibility and clean cancellation
-- **Confirmation interception** — suppresses unnecessary "shall I proceed?" messages when any active plan exists
-- **Subagent failure awareness** — pokes parent session when a sub-agent fails
+## What It Looks Like
+
+When an agent creates a plan, a Feishu card appears in the user's chat:
+
+```
+🗂 Fix market-watch monitoring system
+████████░░░░░░░░ 2/4 (50%)
+
+● [done] Diagnose price-monitor crash root cause
+● [done] Fix code and verify stable operation
+◉ [active] Confirm XAUT price watch resumed — running verification
+○ Confirm Iran news watch resumed
+```
+
+The card updates in real-time as the agent progresses. One card per plan, PATCHed in place — no message spam.
+
+## Core Capabilities
+
+- **`plan_write` tool** — agents create and update task plans with status tracking (pending → in_progress → completed/cancelled/failed)
+- **Multiple concurrent plans** — unrelated tasks arriving mid-work get separate plans with separate cards
+- **Subagent plan delegation** — sub-agents automatically update the parent's plan and card, not their own
+- **Spawn gating** — `sessions_spawn` is blocked until a plan exists, ensuring user visibility before long background operations
+- **System prompt injection** — active plans are injected every turn (adaptive: sparse when just updated, full when stale)
+- **Conversation-aware routing** — cards go to the correct chat (group or DM), not always the requester's DM
+- **Confirmation interception** — suppresses "shall I proceed?" when the agent has a plan and should just execute
+- **Cancellation support** — agents mark remaining items as `cancelled` when the user stops a task
 
 ## How It Works
 
@@ -23,67 +39,89 @@ Structured task planning for OpenClaw agents. Keeps agents on track across tool 
 
 ```
 Agent receives task
-  → plan_write (create plan with pending items)
-  → work on items, updating status as it goes
-  → plan_write (close plan with all items completed)
+  → plan_write (create plan — all items pending)
+  → work through items, updating status as it goes
+  → plan_write (close plan — all items completed)
   → deliver final result
 ```
 
-Multiple plans can be active simultaneously. Each plan is identified by its title — the agent uses the same title to update an existing plan, or a different title to create a new concurrent plan. Each plan gets its own progress card/message.
-
 ### Subagent Delegation
 
-When an agent spawns a sub-agent, the plugin automatically delegates plan ownership:
+When an agent spawns a sub-agent:
 
 ```
 Agent creates plan → spawns sub-agent
-  → subagent_spawned hook links child to parent's planDir
-  → sub-agent sees parent's plan via before_prompt_build
+  → plugin links child session to parent's plan directory
   → sub-agent's plan_write updates parent's plan file
-  → Feishu/Telegram card is PATCHed (same card, not a new one)
+  → same Feishu/Telegram card gets PATCHed
   → parent resumes and can continue updating the same plan
 ```
 
-Spawning is gated: `sessions_spawn` is blocked if the agent has no active plan, forcing the agent to create one first. This ensures the user always has visibility and can cancel cleanly.
+The agent MUST create a plan before spawning — `sessions_spawn` is blocked otherwise. This ensures the user always sees what's happening, and cancellation works cleanly.
 
 ### System Prompt Injection
 
-Every turn, `before_prompt_build` injects context based on plan state:
+Every turn, the plugin injects plan context based on recency:
 
 | State | Injection | Purpose |
 |-------|-----------|---------|
-| No plan | `<plan_available>` | Nudge agent to create a plan for multi-step work |
-| Just updated (idle < 3) | Sparse reminder | Save tokens — agent already has full context |
-| Normal (idle 3–7) | Full reminder | Show current plan status with all items |
-| Stale (idle ≥ 8) | Full + warning | Prompt agent to update the plan |
+| No plan | `<plan_available>` | Nudge to create a plan for multi-step work |
+| Just updated (idle < 3 turns) | Sparse reminder | Save tokens — agent already has context |
+| Normal (idle 3–7) | Full plan state | Re-anchor the agent on current progress |
+| Stale (idle ≥ 8) | Full + warning | Prompt agent to update before it drifts |
 
 ### Channel Notifications
 
-When the agent calls `plan_write`, progress is pushed to the conversation where the request originated:
+Progress cards are sent to the conversation where the request originated:
 
-- **Feishu** — interactive Card 2.0 with stacked bar chart progress, live-updated via PATCH
-- **Telegram** — plain-text message with Unicode progress bar, live-updated via editMessage
+- **Feishu** — Card 2.0 with stacked bar chart progress, live-updated via PATCH
+- **Telegram** — plain-text with Unicode progress bar, live-updated via editMessage
 - **Other channels** — plan still works for agent self-tracking; no push notification
 
-The `message_received` hook captures `conversationId` so cards are sent to the correct chat (group or DM), not always to the requester's DM.
+## Notes for AI Agents
 
-### Confirmation Interception
+If you're an AI agent with `plan_write` available, here's what you need to know:
 
-The `message_sending` hook detects short confirmation-request messages (e.g., "shall I proceed?", "是否继续?") and suppresses them when an active plan exists. Conservative matching — would rather miss than false-positive.
+**When to create a plan:**
+- Any task with 3+ distinct steps — even purely linear ones (read → analyze → write). A plan keeps you anchored through context compaction and shows the user you're making progress.
+- ALWAYS before spawning sub-agents. The spawn will be **blocked** if you don't have a plan. Break down the full task first, then spawn.
+
+**When NOT to create a plan:**
+- Quick answers, single lookups, tasks completable in 1-3 tool calls.
+
+**How to use plan_write effectively:**
+- Create the plan at the START, before doing any work.
+- 3-10 items is the sweet spot. Keep items high-level ("Analyze dataset", not "Open file, read line 1, parse JSON...").
+- Mark one item `in_progress` at a time. Move to `completed` when done.
+- Pass the COMPLETE items array every time — it's a full replacement, not a diff.
+- Use the `message` field for status notes ("Found 3 issues, fixing now").
+
+**Multiple plans:**
+- Each plan is identified by its title. Use the EXACT same title to update an existing plan.
+- If an unrelated task arrives mid-work, create a new plan with a different title.
+
+**Cancellation:**
+- When the user says to stop or cancel, call `plan_write` immediately: mark remaining pending/in_progress items as `cancelled`, set the `message` field to explain why.
+- Never leave a plan in a stale state with items still `in_progress`.
+
+**Autonomous execution:**
+- Once the plan is written, execute it without asking for confirmation at each step.
+- Only pause for genuinely unexpected blockers that require a real decision.
+- Ask all clarifying questions BEFORE creating the plan, not during execution.
 
 ## Plan Statuses
 
-| Status | Text Symbol | Card Symbol | Card Color |
-|--------|-------------|-------------|------------|
+| Status | Text | Card | Color |
+|--------|------|------|-------|
 | pending | ○ | ○ | default |
 | in_progress | ◉ | ◉ **bold** | orange |
-| completed | ● | ● ~~strikethrough~~ | grey |
-| cancelled | ✕ | ✕ ~~strikethrough~~ | dark yellow |
+| completed | ● | ● ~~strike~~ | grey |
+| cancelled | ✕ | ✕ ~~strike~~ | dark yellow |
 | failed | ✗ | ✗ **bold** | red |
 
 ## Installation
 
-Add to your `openclaw.json`:
+Add to `openclaw.json`:
 
 ```json
 {
@@ -98,11 +136,9 @@ Add to your `openclaw.json`:
 }
 ```
 
-Restart the gateway to load the plugin.
+Restart the gateway to load.
 
 ### Feishu Setup (optional)
-
-To enable Feishu card notifications, configure credentials in `openclaw.json`:
 
 ```json
 {
@@ -116,11 +152,9 @@ To enable Feishu card notifications, configure credentials in `openclaw.json`:
 }
 ```
 
-Per-agent accounts are supported via `channels.feishu.accounts.{agentAccountId}`.
+Per-agent accounts supported via `channels.feishu.accounts.{agentAccountId}`.
 
 ### Telegram Setup (optional)
-
-To enable Telegram message notifications:
 
 ```json
 {
@@ -132,9 +166,9 @@ To enable Telegram message notifications:
 }
 ```
 
-Per-agent accounts are supported via `channels.telegram.accounts.{agentAccountId}.botToken`.
+Per-agent accounts supported via `channels.telegram.accounts.{agentAccountId}.botToken`.
 
-## File Structure
+## Architecture
 
 ```
 src/
@@ -143,7 +177,7 @@ src/
 ├── plan-tool.ts          # plan_write tool schema and description
 ├── plan-state.ts         # Disk I/O: atomic read/write of .plan.json files
 ├── plan-injection.ts     # System prompt text + Feishu card + plain-text rendering
-├── runtime-state.ts      # In-memory session state: idle counters, active-plan flags
+├── runtime-state.ts      # In-memory session state: idle counters, delegation, conversation tracking
 ├── feishu-client.ts      # Feishu REST client (send/update cards, token cache)
 └── telegram-client.ts    # Telegram Bot API client (send/edit messages)
 ```
@@ -156,10 +190,10 @@ Plan files are stored per-agent, per-session, per-plan:
 
 ## Known Limitations
 
-- **Telegram plain text only** — messages do not use `parse_mode`, so Markdown formatting is not rendered
-- **Subagent poke uses private API** — `enqueueSystemEvent` is not part of the formal Plugin SDK; may break on OpenClaw upgrades
-- **Delegation requires same agentDir** — subagent plan delegation only works when parent and child share the same `agentDir` (true for same-agent subagents)
-- **ConversationId availability** — card routing to group chats depends on `conversationId` being present in the `message_received` hook context; if unavailable, falls back to requester DM
+- **Telegram plain text only** — no `parse_mode`, so Markdown symbols render as-is
+- **Delegation requires same agentDir** — subagent plan delegation only works when parent and child share the same agent directory
+- **Subagent poke uses private API** — `enqueueSystemEvent` is not part of the formal Plugin SDK; may break on upgrades
+- **ConversationId fallback** — card routing to group chats depends on `conversationId` in the `message_received` hook; falls back to requester DM if unavailable
 
 ## Requirements
 
