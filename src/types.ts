@@ -28,6 +28,7 @@ export interface PlanTelegramState {
 }
 
 export interface PlanFile {
+  /** Reserved for future format migration. Currently always "1" and not checked at read time. */
   version: "1";
   sessionId: string;
   agentId: string;

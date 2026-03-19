@@ -1,5 +1,8 @@
 /**
  * Planning Plugin - Plan File Read/Write
+ *
+ * v2: Plans are stored in a per-session directory, one file per plan (keyed by title hash).
+ * Legacy v1 single-file format is read for migration but new writes always use v2.
  */
 
 import * as fs from "fs/promises";
@@ -8,17 +11,35 @@ import { createHash } from "crypto";
 import type { PlanFile, PlanWriteInput } from "./types.js";
 
 /**
- * Resolve the plan file path for a given agent + session.
- * Path: ~/.openclaw/agents/{agentId}/plans/{sessionId-prefix}.plan.json
+ * Resolve the plan directory for a given agent + session.
+ * Path: {agentDir}/plans/{sessionHash}/
  */
-export function resolvePlanPath(agentDir: string, sessionId: string): string {
+export function resolvePlanDir(agentDir: string, sessionId: string): string {
+  const prefix = createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
+  return path.join(agentDir, "plans", prefix);
+}
+
+/**
+ * Resolve a specific plan file path within a session directory.
+ * Plans are identified by a hash of their title.
+ */
+export function resolvePlanFilePath(planDir: string, title: string): string {
+  const hash = createHash("sha256").update(title).digest("hex").slice(0, 12);
+  return path.join(planDir, `${hash}.plan.json`);
+}
+
+/**
+ * Legacy v1 plan path (single file per session).
+ * Used for migration reads only.
+ */
+export function resolveLegacyPlanPath(agentDir: string, sessionId: string): string {
   const prefix = createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
   return path.join(agentDir, "plans", `${prefix}.plan.json`);
 }
 
 /**
  * Read an existing plan file. Returns null if not found.
- * Throws on JSON corruption or unexpected I/O errors.
+ * Throws on unexpected I/O errors.
  */
 export async function readPlan(planPath: string): Promise<PlanFile | null> {
   try {
@@ -32,12 +53,60 @@ export async function readPlan(planPath: string): Promise<PlanFile | null> {
 }
 
 /**
+ * Read all plan files for a session directory.
+ */
+export async function readAllPlansFromDir(planDir: string): Promise<PlanFile[]> {
+  const plans: PlanFile[] = [];
+  try {
+    const entries = await fs.readdir(planDir);
+    for (const entry of entries) {
+      if (!entry.endsWith(".plan.json")) continue;
+      const plan = await readPlan(path.join(planDir, entry));
+      if (plan) plans.push(plan);
+    }
+  } catch (err: any) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  return plans;
+}
+
+/**
+ * Read all plans for a session (v2 directory + legacy v1 single file).
+ */
+export async function readAllPlans(agentDir: string, sessionId: string): Promise<PlanFile[]> {
+  const planDir = resolvePlanDir(agentDir, sessionId);
+  const plans = await readAllPlansFromDir(planDir);
+
+  // Also check legacy single-file format and auto-migrate active plans
+  const legacyPath = resolveLegacyPlanPath(agentDir, sessionId);
+  const legacy = await readPlan(legacyPath);
+  if (legacy && !plans.some((p) => p.title === legacy.title)) {
+    const hasActiveItems = legacy.items.some((i) => i.status === "pending" || i.status === "in_progress");
+    if (hasActiveItems) {
+      // Migrate active legacy plan to v2 directory format so plan_write can update it
+      const v2Path = resolvePlanFilePath(planDir, legacy.title);
+      await writePlan(v2Path, legacy);
+      await fs.unlink(legacyPath).catch(() => {});
+    }
+    plans.push(legacy);
+  }
+
+  return plans;
+}
+
+/**
  * Write a plan file atomically (tmp + rename). Creates parent directories if needed.
  */
 export async function writePlan(planPath: string, plan: PlanFile): Promise<void> {
   await fs.mkdir(path.dirname(planPath), { recursive: true });
-  const tmp = planPath + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(plan, null, 2), "utf-8");
+  // Unique tmp name avoids collisions when concurrent plan_write calls target the same file
+  const tmp = `${planPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(plan, null, 2), "utf-8");
+  } catch (err) {
+    await fs.unlink(tmp).catch(() => {});
+    throw err;
+  }
   try {
     await fs.rename(tmp, planPath);
   } catch (err) {
@@ -64,6 +133,9 @@ export function buildPlan(
     updatedAt: now,
     feishu: existing?.feishu,
     telegram: existing?.telegram,
+    // Full replacement: items not present in input are silently dropped (by design —
+    // plan_write docs say "pass ALL items every time"). New items (no prev) get fresh timestamps;
+    // unchanged items preserve their original updatedAt.
     items: input.items.map((item) => {
       const prev = existing?.items.find((i) => i.id === item.id);
       const changed = !prev || prev.status !== item.status || prev.content !== item.content || prev.activeForm !== item.activeForm;

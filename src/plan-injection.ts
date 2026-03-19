@@ -41,11 +41,7 @@ function textProgressBar(completed: number, total: number): string {
   return `${"█".repeat(filled)}${"░".repeat(BAR - filled)} ${completed}/${total} (${pct}%)`;
 }
 
-/**
- * Build full <plan_reminder> for injection when an active plan exists.
- * Optionally appends a stale-plan warning when idleCount is high.
- */
-export function buildPlanReminder(plan: PlanFile, stale = false): string {
+function buildSinglePlanSection(plan: PlanFile): string {
   const total = plan.items.length;
   const completed = plan.items.filter((i) => i.status === "completed").length;
   const inProgress = plan.items.filter((i) => i.status === "in_progress");
@@ -56,17 +52,32 @@ export function buildPlanReminder(plan: PlanFile, stale = false): string {
       ? "\n⚠️ No task is currently in_progress. Mark the active task in_progress before proceeding."
       : "";
 
+  return `── ${plan.title} ──\n${itemLines}\nProgress: ${textProgressBar(completed, total)}${noInProgressWarning}`;
+}
+
+/**
+ * Build full <plan_reminder> for injection when active plans exist.
+ * Optionally appends a stale-plan warning when idleCount is high.
+ */
+export function buildPlanReminder(plans: PlanFile[], stale = false): string {
+  const planCount = plans.length;
+  const sections = plans.map(buildSinglePlanSection).join("\n\n");
+
+  const header = planCount === 1
+    ? `Current plan: ${plans[0].title}`
+    : `You have ${planCount} active plans. Update each by passing its exact title to plan_write.`;
+
   const staleWarning = stale
     ? "\n⚠️ plan_write hasn't been called in a while. Update task statuses now."
     : "";
 
+  // Single plan reuses buildSinglePlanSection to avoid logic duplication
+  const body = planCount === 1
+    ? `\n${buildSinglePlanSection(plans[0])}`
+    : `\n\n${sections}`;
+
   return `<plan_reminder>
-Current plan: ${plan.title}
-
-${itemLines}
-
-Progress: ${textProgressBar(completed, total)}
-${noInProgressWarning}${staleWarning}
+${header}${body}${staleWarning}
 Update plan_write when you complete a step or the plan changes.
 Mark items in_progress when starting, completed when done.
 Execute autonomously — do not stop to ask "shall I proceed?" or "is this okay?". Only pause for genuinely unexpected blockers requiring a real decision.
@@ -77,17 +88,24 @@ Execute autonomously — do not stop to ask "shall I proceed?" or "is this okay?
  * Build sparse <plan_reminder> — used when plan was just updated (low idle count).
  * Saves tokens; model already has full context from the recent plan_write call.
  */
-export function buildPlanReminderSparse(plan: PlanFile): string {
-  const total = plan.items.length;
-  const completed = plan.items.filter((i) => i.status === "completed").length;
-  const active = plan.items.find((i) => i.status === "in_progress");
-  const activeSuffix = active
-    ? ` · now: ${active.activeForm ?? active.content}`
-    : " · no task in_progress";
+export function buildPlanReminderSparse(plans: PlanFile[]): string {
+  const summaries = plans.map((plan) => {
+    const total = plan.items.length;
+    const completed = plan.items.filter((i) => i.status === "completed").length;
+    const active = plan.items.find((i) => i.status === "in_progress");
+    const activeSuffix = active
+      ? ` · now: ${active.activeForm ?? active.content}`
+      : " · no task in_progress";
+    return `"${plan.title}" (${completed}/${total} done)${activeSuffix}`;
+  });
+
+  const hint = plans.length > 1
+    ? " Pass the plan's exact title to update the right plan."
+    : "";
 
   return `<plan_reminder>
-Plan: ${plan.title} (${completed}/${total} done)${activeSuffix}
-Use plan_write to update status as you work.
+${plans.length === 1 ? "Plan" : "Plans"}: ${summaries.join(" | ")}
+Use plan_write to update status as you work.${hint}
 </plan_reminder>`;
 }
 
@@ -97,6 +115,7 @@ Use plan_write to update status as you work.
 export function buildPlanAvailable(): string {
   return `<plan_available>
 plan_write is available. Use it before any multi-step work — even linear tasks. A plan keeps you on track across tool calls and context compaction, and shows the user what's happening instead of leaving them waiting blind.
+Multiple concurrent plans are supported — use different titles for unrelated tasks arriving mid-work.
 Workflow: ask all clarifying questions upfront (before the plan), then execute the plan autonomously without stopping to confirm each step.
 </plan_available>`;
 }
@@ -161,10 +180,7 @@ export function renderFeishuCard(plan: PlanFile, message?: string): Record<strin
   const bodyElements: Record<string, unknown>[] = [];
 
   // ── Stacked horizontal barChart as progress bar ──────────────────────────────
-  // linearProgress mark-level styles are sandboxed by Feishu; barChart + color[]
-  // is the most stable coloring API available in Feishu's VChart environment.
-  const filledPct = total > 0 ? Math.round((completed / total) * 100) : 0;
-  const emptyPct = 100 - filledPct;
+  const emptyPct = 100 - pct;
   bodyElements.push({
     tag: "chart",
     height: "24px",
@@ -173,7 +189,7 @@ export function renderFeishuCard(plan: PlanFile, message?: string): Record<strin
       data: [
         {
           values: [
-            { x: "p", y: filledPct, t: "done" },
+            { x: "p", y: pct, t: "done" },
             { x: "p", y: emptyPct,  t: "todo" },
           ],
         },

@@ -7,10 +7,12 @@
 ## 功能特性
 
 - **`plan_write` 工具** — agent 在多步任务中创建和更新任务计划
-- **系统提示注入** — 每轮对话自动注入当前计划状态（简洁/完整/过期提醒，根据更新频率自适应）
+- **多计划并发** — agent 可在同一 session 中用不同标题跟踪多个不相关任务
+- **系统提示注入** — 每轮对话自动注入所有活跃计划状态（简洁/完整/过期提醒，根据更新频率自适应）
+- **会话感知卡片路由** — 通过 `message_received` 钩子捕获会话 ID，通知发送到正确的聊天（群聊或私聊）
 - **飞书互动卡片** — 可视化进度卡片，通过 PATCH 实时更新
 - **Telegram 消息** — 纯文本进度展示，通过 editMessage 实时更新
-- **确认拦截** — 当存在活跃计划时，自动拦截不必要的"要继续吗？"类确认消息
+- **确认拦截** — 当存在任何活跃计划时，自动拦截不必要的"要继续吗？"类确认消息
 - **子任务感知** — 当子 agent 失败时，通知父 session
 
 ## 工作原理
@@ -25,6 +27,8 @@ Agent 收到任务
   → 输出最终结果
 ```
 
+支持同时维护多个活跃计划。每个计划通过标题标识——agent 使用相同标题更新已有计划，使用不同标题创建新的并发计划。每个计划拥有独立的进度卡片/消息。
+
 ### 系统提示注入
 
 每轮对话中，`before_prompt_build` 根据计划状态注入上下文：
@@ -38,11 +42,13 @@ Agent 收到任务
 
 ### 渠道通知
 
-当 agent 调用 `plan_write` 时，进度会推送到用户所在渠道：
+当 agent 调用 `plan_write` 时，进度会推送到请求发起的会话中：
 
 - **飞书** — Card 2.0 互动卡片，带堆叠条形图进度条，通过 PATCH 实时更新
 - **Telegram** — 纯文本消息，带 Unicode 进度条，通过 editMessage 实时更新
 - **其他渠道** — 计划仍可用于 agent 自我追踪，但不推送通知
+
+`message_received` 钩子捕获 `conversationId`，确保卡片发送到正确的聊天（群聊或私聊），而非始终发送到请求者的私聊。
 
 ### 确认拦截
 
@@ -115,7 +121,7 @@ Agent 收到任务
 
 ```
 src/
-├── index.ts              # 插件入口 — 注册工具 + 4 个钩子
+├── index.ts              # 插件入口 — 注册工具 + 6 个钩子
 ├── types.ts              # 核心类型：PlanFile、PlanItem、PlanStatus
 ├── plan-tool.ts          # plan_write 工具的 schema 和说明
 ├── plan-state.ts         # 磁盘 I/O：原子读写 .plan.json 文件
@@ -125,18 +131,18 @@ src/
 └── telegram-client.ts    # Telegram Bot API 客户端（发送/编辑消息）
 ```
 
-计划文件按 agent 和 session 隔离存储：
+计划文件按 agent、session 和计划标题隔离存储：
 
 ```
-~/.openclaw/agents/{agentId}/plans/{hash}.plan.json
+~/.openclaw/agents/{agentId}/plans/{sessionHash}/{titleHash}.plan.json
 ```
 
 ## 已知限制
 
-- **换标题后旧卡片不清理** — agent 更改计划标题时会发送新卡片，但旧卡片不会被删除
 - **Telegram 仅纯文本** — 消息未使用 `parse_mode`，Markdown 格式不会被渲染
 - **子 agent 通知使用私有 API** — `enqueueSystemEvent` 不属于正式的 Plugin SDK，OpenClaw 升级后可能失效
 - **计划不跨 session 共享** — 每个 session 有独立的计划，子 agent 无法直接更新父 session 的计划
+- **conversationId 可用性** — 卡片路由到群聊依赖 `message_received` 钩子上下文中的 `conversationId`；若不可用则回退到请求者私聊
 
 ## 环境要求
 

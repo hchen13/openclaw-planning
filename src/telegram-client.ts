@@ -10,8 +10,16 @@ interface TelegramSendResult {
   chatId: string;
 }
 
+/** Telegram Bot API limits text to 4096 characters for sendMessage/editMessageText. */
+const TG_MAX_TEXT = 4096;
+
 function botApiUrl(token: string, method: string): string {
   return `https://api.telegram.org/bot${token}/${method}`;
+}
+
+function truncateText(text: string): string {
+  if (text.length <= TG_MAX_TEXT) return text;
+  return text.slice(0, TG_MAX_TEXT - 4) + " ...";
 }
 
 /**
@@ -37,7 +45,7 @@ export async function sendMessageTg(
   const res = await fetch(botApiUrl(token, "sendMessage"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({ chat_id: chatId, text: truncateText(text) }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -69,7 +77,7 @@ export async function editMessageTg(
   const res = await fetch(botApiUrl(token, "editMessageText"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text }),
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: truncateText(text) }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");

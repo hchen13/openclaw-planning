@@ -6,13 +6,24 @@
  *   Hook:   before_prompt_build — inject plan reminder (sparse / full / stale)
  *   Hook:   after_tool_call     — maintain per-session idle counter
  *   Hook:   subagent_ended      — poke parent session when announce may be skipped
+ *   Hook:   message_received    — capture conversationId for card routing
  *   Hook:   message_sending     — intercept pointless confirmation requests
  */
 
 import * as path from "path";
+import { unlink } from "fs/promises";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { PlanWriteSchema, PLAN_WRITE_DESCRIPTION } from "./plan-tool.js";
-import { resolvePlanPath, readPlan, writePlan, buildPlan } from "./plan-state.js";
+import {
+  resolvePlanDir,
+  resolvePlanFilePath,
+  resolveLegacyPlanPath,
+  readPlan,
+  readAllPlans,
+  readAllPlansFromDir,
+  writePlan,
+  buildPlan,
+} from "./plan-state.js";
 import {
   buildPlanReminder,
   buildPlanReminderSparse,
@@ -21,19 +32,23 @@ import {
   renderFeishuCard,
   renderPlainText,
 } from "./plan-injection.js";
-import { sendCard, updateCard } from "./feishu-client.js";
+import { sendCard, updateCard, normalizeTargetId } from "./feishu-client.js";
 import { resolveTelegramToken, sendMessageTg, editMessageTg } from "./telegram-client.js";
 import {
   recordToolCall,
   setSessionMeta,
   getIdleCount,
-  getPlanPath,
+  getPlanDir,
   setAgentActivePlan,
   getAgentActivePlan,
   setSessionActivePlan,
   getSessionActivePlan,
   setSessionAgentDir,
   getSessionAgentDir,
+  setSessionConversationId,
+  getSessionConversationId,
+  setAccountConversationId,
+  getAccountConversationId,
 } from "./runtime-state.js";
 import type { PlanWriteInput } from "./types.js";
 
@@ -94,6 +109,52 @@ function isUnnecessaryConfirmation(content: string): boolean {
   return patterns.some((p) => p.test(content));
 }
 
+/**
+ * Resolve the best target ID for sending channel notifications.
+ * Prefers conversationId (correct for group chats) over requesterSenderId (user DM).
+ *
+ * Edge case: if message_received hasn't fired yet (e.g. plan_write on the very first
+ * turn), conversationId is undefined and card falls back to requester DM. This is
+ * acceptable — the next plan_write update will route correctly once conversationId
+ * has been captured.
+ */
+function resolveNotificationTarget(
+  sessionKey: string | undefined,
+  agentAccountId: string | undefined,
+  requesterSenderId: string | undefined,
+): string | undefined {
+  // 1. Per-session conversationId (most precise)
+  if (sessionKey) {
+    const sessionConv = getSessionConversationId(sessionKey);
+    if (sessionConv) return sessionConv;
+  }
+  // 2. Per-account conversationId (fallback when session not tracked)
+  if (agentAccountId) {
+    const accountConv = getAccountConversationId(agentAccountId);
+    if (accountConv) return accountConv;
+  }
+  // 3. Original sender ID (legacy behavior — sends to DM)
+  return requesterSenderId;
+}
+
+/**
+ * Read-then-patch channel state on plan file to avoid TOCTOU race condition.
+ * Between the initial writePlan and the channel API call (which may take seconds),
+ * another plan_write could have updated the file. Re-read before patching ensures
+ * we don't overwrite concurrent changes.
+ */
+async function patchPlanChannelState(
+  planPath: string,
+  patch: { feishu?: { messageId: string; targetId: string; lastUpdatedAt: number; sessionId: string };
+           telegram?: { messageId: number; chatId: string; lastUpdatedAt: number; sessionId: string } },
+): Promise<void> {
+  const latest = await readPlan(planPath);
+  if (!latest) return; // Plan was deleted between write and now
+  if (patch.feishu) latest.feishu = patch.feishu;
+  if (patch.telegram) latest.telegram = patch.telegram;
+  await writePlan(planPath, latest);
+}
+
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
 const plugin = {
@@ -124,61 +185,99 @@ const plugin = {
           parameters: PlanWriteSchema,
           async execute(_toolCallId: string, params: unknown) {
             const input = params as PlanWriteInput;
-            const planPath = resolvePlanPath(agentDir, sessionId);
-            const existing = await readPlan(planPath);
+            const planDir = resolvePlanDir(agentDir, sessionId);
+            const planPath = resolvePlanFilePath(planDir, input.title);
 
-            // Empty items → clear plan
-            if (!input.items || input.items.length === 0) {
-              const { unlink } = await import("fs/promises");
-              try { await unlink(planPath); } catch (err: any) { if (err.code !== "ENOENT") throw err; }
-              logger.info?.(`planning: plan cleared for session ${sessionId.slice(0, 8)}`);
-              return { content: [{ type: "text" as const, text: "Plan cleared." }] };
+            // Read existing plan for this specific title
+            let existing = await readPlan(planPath);
+
+            // Migration: check legacy single-file format
+            if (!existing) {
+              const legacyPath = resolveLegacyPlanPath(agentDir, sessionId);
+              const legacy = await readPlan(legacyPath);
+              if (legacy && legacy.title === input.title) {
+                existing = legacy;
+              }
             }
 
-            // New title → treat as fresh plan (clear feishu messageId)
-            const isNewPlan = existing !== null && existing.title !== input.title;
-            const plan = buildPlan(input, isNewPlan ? null : existing, {
+            // Empty items → clear this specific plan
+            if (!input.items || input.items.length === 0) {
+              try { await unlink(planPath); } catch (err: any) { if (err.code !== "ENOENT") throw err; }
+              // Also try legacy path
+              const legacyPath = resolveLegacyPlanPath(agentDir, sessionId);
+              const legacyPlan = await readPlan(legacyPath);
+              if (legacyPlan && legacyPlan.title === input.title) {
+                try { await unlink(legacyPath); } catch (err: any) { if (err.code !== "ENOENT") throw err; }
+              }
+              // Sync runtime state so message_sending hook doesn't think a plan is still active
+              const remainingPlans = await readAllPlans(agentDir, sessionId);
+              const stillActive = remainingPlans.some((p) => isPlanActive(p));
+              if (sessionKey) setSessionActivePlan(sessionKey, stillActive);
+              if (agentId) setAgentActivePlan(agentId ?? "unknown", stillActive);
+
+              logger.info?.(`planning: plan "${input.title}" cleared for session ${sessionId.slice(0, 8)}`);
+              return { content: [{ type: "text" as const, text: `Plan "${input.title}" cleared.` }], details: undefined };
+            }
+
+            // Build and write plan
+            const plan = buildPlan(input, existing, {
               sessionId,
               agentId: agentId ?? "unknown",
             });
-
             await writePlan(planPath, plan);
+
+            // Clean up legacy file if we migrated
+            if (existing) {
+              const legacyPath = resolveLegacyPlanPath(agentDir, sessionId);
+              const legacyPlan = await readPlan(legacyPath);
+              if (legacyPlan && legacyPlan.title === input.title) {
+                try { await unlink(legacyPath); } catch { /* best effort */ }
+              }
+            }
+
             logger.info?.(
               `planning: plan updated "${plan.title}" ` +
               `${plan.items.filter((i) => i.status === "completed").length}/${plan.items.length} ` +
               `for session ${sessionId.slice(0, 8)}`
             );
 
-            // Channel progress notifications
+            // ── Channel progress notifications ──────────────────────────────
             const channel = ctx.messageChannel;
-            const senderId = ctx.requesterSenderId;
+            const notifyTarget = resolveNotificationTarget(
+              sessionKey,
+              ctx.agentAccountId,
+              ctx.requesterSenderId,
+            );
 
             // Feishu card
             const creds = resolveFeishuCreds(ctx.config, ctx.agentAccountId);
 
-            if (channel === "feishu" && creds && senderId) {
+            if (channel === "feishu" && creds && notifyTarget) {
               const cardJson = renderFeishuCard(plan, input.message);
               const feishuSameSession = plan.feishu?.sessionId === sessionId;
               if (plan.feishu?.messageId && feishuSameSession) {
                 try {
                   await updateCard(creds, plan.feishu.messageId, cardJson);
-                  plan.feishu.lastUpdatedAt = Date.now();
-                  await writePlan(planPath, plan);
+                  await patchPlanChannelState(planPath, {
+                    feishu: { messageId: plan.feishu.messageId, targetId: plan.feishu.targetId, sessionId: plan.feishu.sessionId ?? sessionId, lastUpdatedAt: Date.now() },
+                  });
                 } catch (err) {
                   logger.warn?.(`planning: PATCH failed, sending new card: ${err}`);
                   try {
-                    const result = await sendCard(creds, senderId, cardJson);
-                    plan.feishu = { messageId: result.messageId, targetId: senderId, lastUpdatedAt: Date.now(), sessionId };
-                    await writePlan(planPath, plan);
+                    const result = await sendCard(creds, notifyTarget, cardJson);
+                    await patchPlanChannelState(planPath, {
+                      feishu: { messageId: result.messageId, targetId: notifyTarget, lastUpdatedAt: Date.now(), sessionId },
+                    });
                   } catch (sendErr) {
                     logger.warn?.(`planning: send card also failed: ${sendErr}`);
                   }
                 }
               } else {
                 try {
-                  const result = await sendCard(creds, senderId, cardJson);
-                  plan.feishu = { messageId: result.messageId, targetId: senderId, lastUpdatedAt: Date.now(), sessionId };
-                  await writePlan(planPath, plan);
+                  const result = await sendCard(creds, notifyTarget, cardJson);
+                  await patchPlanChannelState(planPath, {
+                    feishu: { messageId: result.messageId, targetId: notifyTarget, lastUpdatedAt: Date.now(), sessionId },
+                  });
                 } catch (err) {
                   logger.warn?.(`planning: send card failed: ${err}`);
                 }
@@ -187,8 +286,8 @@ const plugin = {
 
             // Telegram text message
             const tgToken = resolveTelegramToken(ctx.config, ctx.agentAccountId);
-            // Use stored chatId for edits (senderId may be null on session resume after yield)
-            const tgChatId = plan.telegram?.chatId ?? senderId;
+            // Use stored chatId for edits; fall back to notifyTarget for new messages
+            const tgChatId = plan.telegram?.chatId ?? notifyTarget;
 
             if (channel === "telegram" && tgToken && tgChatId) {
               const text = renderPlainText(plan, input.message);
@@ -196,14 +295,16 @@ const plugin = {
               if (plan.telegram?.messageId && tgSameSession) {
                 try {
                   await editMessageTg(tgToken, plan.telegram.chatId, plan.telegram.messageId, text);
-                  plan.telegram.lastUpdatedAt = Date.now();
-                  await writePlan(planPath, plan);
+                  await patchPlanChannelState(planPath, {
+                    telegram: { messageId: plan.telegram.messageId, chatId: plan.telegram.chatId, sessionId: plan.telegram.sessionId ?? sessionId, lastUpdatedAt: Date.now() },
+                  });
                 } catch (err) {
                   logger.warn?.(`planning: Telegram edit failed, sending new message: ${err}`);
                   try {
                     const result = await sendMessageTg(tgToken, tgChatId, text);
-                    plan.telegram = { messageId: result.messageId, chatId: result.chatId, lastUpdatedAt: Date.now(), sessionId };
-                    await writePlan(planPath, plan);
+                    await patchPlanChannelState(planPath, {
+                      telegram: { messageId: result.messageId, chatId: result.chatId, lastUpdatedAt: Date.now(), sessionId },
+                    });
                   } catch (sendErr) {
                     logger.warn?.(`planning: Telegram send also failed: ${sendErr}`);
                   }
@@ -211,23 +312,33 @@ const plugin = {
               } else {
                 try {
                   const result = await sendMessageTg(tgToken, tgChatId, text);
-                  plan.telegram = { messageId: result.messageId, chatId: result.chatId, lastUpdatedAt: Date.now(), sessionId };
-                  await writePlan(planPath, plan);
+                  await patchPlanChannelState(planPath, {
+                    telegram: { messageId: result.messageId, chatId: result.chatId, lastUpdatedAt: Date.now(), sessionId },
+                  });
                 } catch (err) {
                   logger.warn?.(`planning: Telegram send failed: ${err}`);
                 }
               }
             }
 
+            // ── Result summary ──────────────────────────────────────────────
+            // Re-read from disk since patchPlanChannelState may have updated channel state
+            const latestPlan = await readPlan(planPath);
+            const allPlans = await readAllPlans(agentDir, sessionId);
+            const activePlans = allPlans.filter((p) => isPlanActive(p));
+
             const completed = plan.items.filter((i) => i.status === "completed").length;
             const total = plan.items.length;
             const allDone = completed === total && total > 0;
-            let resultText = `Plan updated: "${plan.title}" — ${completed}/${total} completed`;
+            let resultText = `Plan "${plan.title}" updated: ${completed}/${total} completed`;
             if (allDone) resultText += " ✓ All tasks done!";
-            if (plan.feishu?.messageId) resultText += ` (feishu card: ${plan.feishu.messageId})`;
-            if (plan.telegram?.messageId) resultText += ` (telegram msg: ${plan.telegram.messageId})`;
+            if (activePlans.length > 1) {
+              resultText += ` (${activePlans.length} active plans total)`;
+            }
+            if (latestPlan?.feishu?.messageId) resultText += ` (feishu card: ${latestPlan.feishu.messageId})`;
+            if (latestPlan?.telegram?.messageId) resultText += ` (telegram msg: ${latestPlan.telegram.messageId})`;
 
-            return { content: [{ type: "text" as const, text: resultText }] };
+            return { content: [{ type: "text" as const, text: resultText }], details: undefined };
           },
         };
       },
@@ -239,13 +350,6 @@ const plugin = {
       const sessionKey: string | undefined = ctx?.sessionKey;
       const sessionId: string | undefined = ctx?.sessionId;
       const agentId: string | undefined = ctx?.agentId;
-      // agentDir is not in the formal hook type — workspaceDir is the same path at runtime
-      // workspaceDir = ~/.openclaw/agents/{agentId}  (the agent root)
-      // agentDir     = ~/.openclaw/agents/{agentId}/agent  (the workspace subfolder, used by tools)
-      // Plan files are written by plan_write using agentDir, so we must append "agent/".
-      // workspaceDir = ~/.openclaw/agents/{agentId}       (agent root, from hook ctx)
-      // agentDir     = ~/.openclaw/agents/{agentId}/agent  (workspace subfolder, used by tools)
-      // Plan files are written by plan_write using agentDir, so append "agent/" here.
       // Prefer agentDir recorded by plan_write (authoritative).
       // Fallback: workspaceDir + "agent" (runtime observation, not formal API).
       const trackedAgentDir = sessionKey ? getSessionAgentDir(sessionKey) : undefined;
@@ -255,16 +359,17 @@ const plugin = {
 
       if (!sessionId || !agentDir) return {};
 
-      const planPath = resolvePlanPath(agentDir, sessionId);
+      const planDir = resolvePlanDir(agentDir, sessionId);
 
       // Keep cross-hook state up to date
       if (sessionKey) {
-        setSessionMeta(sessionKey, { planPath, agentId });
+        setSessionMeta(sessionKey, { planDir, agentId });
       }
 
-      const plan = await readPlan(planPath);
+      const allPlans = await readAllPlans(agentDir, sessionId);
+      const activePlans = allPlans.filter((p) => isPlanActive(p));
 
-      if (plan && isPlanActive(plan)) {
+      if (activePlans.length > 0) {
         if (agentId) setAgentActivePlan(agentId, true);
         if (sessionKey) setSessionActivePlan(sessionKey, true);
 
@@ -273,13 +378,13 @@ const plugin = {
         let reminder: string;
         if (idleCount < SPARSE_THRESHOLD) {
           // Just updated — short reminder to save tokens
-          reminder = buildPlanReminderSparse(plan);
+          reminder = buildPlanReminderSparse(activePlans);
         } else if (idleCount >= STALE_THRESHOLD) {
           // Many tool calls without an update — full + stale warning
-          reminder = buildPlanReminder(plan, /* stale= */ true);
+          reminder = buildPlanReminder(activePlans, /* stale= */ true);
         } else {
           // Normal range — full reminder
-          reminder = buildPlanReminder(plan, /* stale= */ false);
+          reminder = buildPlanReminder(activePlans, /* stale= */ false);
         }
 
         return { prependContext: reminder };
@@ -310,13 +415,13 @@ const plugin = {
       if (outcome === "ok") return; // Announce will handle it
 
       const subagentKey: string = event?.targetSessionKey ?? ctx?.childSessionKey ?? "unknown";
-      const planPath = getPlanPath(parentKey);
-      if (!planPath) return; // Parent session not seen yet, skip
+      const planDir = getPlanDir(parentKey);
+      if (!planDir) return; // Parent session not seen yet, skip
 
       setTimeout(async () => {
         try {
-          const plan = await readPlan(planPath);
-          if (!plan || !isPlanActive(plan)) return;
+          const plans = await readAllPlansFromDir(planDir);
+          if (!plans.some((p) => isPlanActive(p))) return;
 
           const msg =
             `[planning] Subagent ${subagentKey.slice(0, 8)} ended with outcome="${outcome}". ` +
@@ -335,6 +440,25 @@ const plugin = {
           logger.warn?.(`planning: subagent_ended poke failed: ${err}`);
         }
       }, SUBAGENT_POKE_DELAY_MS);
+    });
+
+    // ── message_received Hook ────────────────────────────────────────────────
+    // Captures conversationId for correct card routing (group chat vs DM).
+    api.on("message_received", async (_event: any, ctx: any) => {
+      const conversationId: string | undefined = ctx?.conversationId;
+      if (!conversationId) return;
+
+      // Per-session (most precise — sessionKey may be available at runtime)
+      const sessionKey: string | undefined = ctx?.sessionKey;
+      if (sessionKey) {
+        setSessionConversationId(sessionKey, conversationId);
+      }
+
+      // Per-account (fallback — always available in message hooks)
+      const accountId: string | undefined = ctx?.accountId;
+      if (accountId) {
+        setAccountConversationId(accountId, conversationId);
+      }
     });
 
     // ── message_sending Hook ─────────────────────────────────────────────────
@@ -361,7 +485,7 @@ const plugin = {
 
     logger.info?.(
       "planning: plugin registered " +
-      "(plan_write + before_prompt_build + after_tool_call + subagent_ended + message_sending)"
+      "(plan_write + before_prompt_build + after_tool_call + subagent_ended + message_received + message_sending)"
     );
   },
 };

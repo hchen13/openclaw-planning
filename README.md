@@ -7,10 +7,12 @@ Structured task planning for OpenClaw agents. Keeps agents on track across tool 
 ## Features
 
 - **`plan_write` tool** — agents create and update task plans during multi-step work
-- **System prompt injection** — current plan state is injected every turn (sparse/full/stale reminders, adaptive to recency)
+- **Multiple concurrent plans** — agents can track unrelated tasks in separate plans within the same session
+- **System prompt injection** — all active plan states are injected every turn (sparse/full/stale reminders, adaptive to recency)
+- **Conversation-aware card routing** — notifications are sent to the correct chat (group or DM) via `message_received` hook
 - **Feishu interactive cards** — visual progress cards with live PATCH updates
 - **Telegram messages** — plain-text progress with live edits
-- **Confirmation interception** — suppresses unnecessary "shall I proceed?" messages when an active plan exists
+- **Confirmation interception** — suppresses unnecessary "shall I proceed?" messages when any active plan exists
 - **Subagent awareness** — pokes parent session when a sub-agent fails
 
 ## How It Works
@@ -25,6 +27,8 @@ Agent receives task
   → deliver final result
 ```
 
+Multiple plans can be active simultaneously. Each plan is identified by its title — the agent uses the same title to update an existing plan, or a different title to create a new concurrent plan. Each plan gets its own progress card/message.
+
 ### System Prompt Injection
 
 Every turn, `before_prompt_build` injects context based on plan state:
@@ -38,11 +42,13 @@ Every turn, `before_prompt_build` injects context based on plan state:
 
 ### Channel Notifications
 
-When the agent calls `plan_write`, progress is pushed to the user's channel:
+When the agent calls `plan_write`, progress is pushed to the conversation where the request originated:
 
 - **Feishu** — interactive Card 2.0 with stacked bar chart progress, live-updated via PATCH
 - **Telegram** — plain-text message with Unicode progress bar, live-updated via editMessage
 - **Other channels** — plan still works for agent self-tracking; no push notification
+
+The `message_received` hook captures `conversationId` so cards are sent to the correct chat (group or DM), not always to the requester's DM.
 
 ### Confirmation Interception
 
@@ -115,7 +121,7 @@ Per-agent accounts are supported via `channels.telegram.accounts.{agentAccountId
 
 ```
 src/
-├── index.ts              # Plugin entry — registers tool + 4 hooks
+├── index.ts              # Plugin entry — registers tool + 6 hooks
 ├── types.ts              # Core types: PlanFile, PlanItem, PlanStatus
 ├── plan-tool.ts          # plan_write tool schema and description
 ├── plan-state.ts         # Disk I/O: atomic read/write of .plan.json files
@@ -125,18 +131,18 @@ src/
 └── telegram-client.ts    # Telegram Bot API client (send/edit messages)
 ```
 
-Plan files are stored per-agent, per-session:
+Plan files are stored per-agent, per-session, per-plan:
 
 ```
-~/.openclaw/agents/{agentId}/plans/{hash}.plan.json
+~/.openclaw/agents/{agentId}/plans/{sessionHash}/{titleHash}.plan.json
 ```
 
 ## Known Limitations
 
-- **Orphan cards on title change** — when an agent changes the plan title, a new card is sent but the old one is not deleted
 - **Telegram plain text only** — messages do not use `parse_mode`, so Markdown formatting is not rendered
 - **Subagent poke uses private API** — `enqueueSystemEvent` is not part of the formal Plugin SDK; may break on OpenClaw upgrades
-- **No cross-session plan sharing** — each session has its own plan; sub-agents cannot update the parent's plan directly
+- **No cross-session plan sharing** — each session has its own plans; sub-agents cannot update the parent's plans directly
+- **ConversationId availability** — card routing to group chats depends on `conversationId` being present in the `message_received` hook context; if unavailable, falls back to requester DM
 
 ## Requirements
 

@@ -14,15 +14,15 @@ export const PlanStatusEnum = Type.Union([
 
 export const PlanItemSchema = Type.Object({
   id: Type.String({ description: "Unique item ID (e.g. t1, t2, t3)" }),
-  content: Type.String({ description: "Task description in imperative form, ≤80 chars", maxLength: 200 }),
+  content: Type.String({ description: "Task description in imperative form, ≤80 chars", maxLength: 80 }),
   status: PlanStatusEnum,
   activeForm: Type.Optional(
-    Type.String({ description: "Present-tense description shown when in_progress, ≤60 chars", maxLength: 120 }),
+    Type.String({ description: "Present-tense description shown when in_progress, ≤60 chars", maxLength: 60 }),
   ),
 });
 
 export const PlanWriteSchema = Type.Object({
-  title: Type.String({ description: "Overall task title, ≤50 chars", maxLength: 100 }),
+  title: Type.String({ description: "Overall task title, ≤50 chars", maxLength: 50 }),
   items: Type.Array(PlanItemSchema, {
     description: "Complete list of plan items. This is a full replacement — pass ALL items every time.",
     maxItems: 20,
@@ -57,6 +57,11 @@ Best practices:
 - If you change item content or add/remove items (not just status), explain why in the \`message\` field
 - When ALL items are done, call plan_write one final time with all items marked completed to close the plan — then send your normal reply with the actual results
 
+Multiple concurrent plans:
+- Each plan is identified by its title — use the EXACT same title to update an existing plan
+- To track a new unrelated task arriving mid-work, call plan_write with a different title
+- Each plan gets its own progress card/message in the user's channel
+- The system prompt will show all active plans; update each by passing its exact title
+
 Clearing a plan:
-- Pass an empty items array to clear the current plan
-- Changing the title starts a fresh plan (new card, new tracking)`;
+- Pass an empty items array with the plan's title to clear that specific plan`;

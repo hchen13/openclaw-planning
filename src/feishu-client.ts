@@ -51,11 +51,28 @@ async function getTenantToken(creds: FeishuCredentials): Promise<string> {
 }
 
 /**
+ * Strip OpenClaw's routing prefix from target IDs.
+ * OpenClaw wraps native IDs as "user:ou_xxx", "group:oc_xxx", etc.
+ * Feishu API expects bare native IDs (ou_xxx, oc_xxx, on_xxx).
+ */
+export function normalizeTargetId(targetId: string): string {
+  const colonIdx = targetId.indexOf(":");
+  if (colonIdx === -1) return targetId;
+  const afterColon = targetId.slice(colonIdx + 1);
+  // Only strip if what follows looks like a Feishu native ID
+  if (afterColon.startsWith("ou_") || afterColon.startsWith("oc_") || afterColon.startsWith("on_")) {
+    return afterColon;
+  }
+  return targetId;
+}
+
+/**
  * Infer receive_id_type from targetId prefix.
- * ou_ → open_id (user), oc_ → chat_id (group), default → open_id.
+ * ou_ → open_id (user), oc_ → chat_id (group), on_ → union_id, default → open_id.
  */
 function resolveReceiveIdType(targetId: string): string {
   if (targetId.startsWith("oc_")) return "chat_id";
+  if (targetId.startsWith("on_")) return "union_id";
   return "open_id";
 }
 
@@ -64,9 +81,10 @@ function resolveReceiveIdType(targetId: string): string {
  */
 export async function sendCard(
   creds: FeishuCredentials,
-  targetId: string,
+  rawTargetId: string,
   card: Record<string, unknown>,
 ): Promise<FeishuCardResult> {
+  const targetId = normalizeTargetId(rawTargetId);
   const token = await getTenantToken(creds);
   const receiveIdType = resolveReceiveIdType(targetId);
   const url = `${baseUrl(creds.domain)}/im/v1/messages?receive_id_type=${receiveIdType}`;
