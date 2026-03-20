@@ -2,6 +2,10 @@
 
 # OpenClaw Planning Plugin
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Planning Plugin Demo" />
+</p>
+
 **The problem:** When an AI agent runs a 20-step task on a messaging platform, the user stares at a blank chat for minutes. There's no progress bar, no status update, no way to know if the agent is stuck or just thinking. When the agent spawns sub-agents, it gets worse — the user has zero visibility into what might be a 10-minute background operation. And if context gets compacted mid-task, the agent forgets what it was doing.
 
 **This plugin fixes that.** It gives agents a `plan_write` tool to create structured task plans. Each plan becomes a live-updating progress card in Feishu or Telegram. The plan is injected into the system prompt every turn, so the agent stays on track even through compaction. Sub-agents automatically update the parent's plan. Users can cancel cleanly because the plan is always visible.
