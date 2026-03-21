@@ -95,7 +95,9 @@ If you're an AI agent with `plan_write` available, here's what you need to know:
 
 **How to use plan_write effectively:**
 - Create the plan at the START, before doing any work.
-- 3-10 items is the sweet spot. Keep items high-level ("Analyze dataset", not "Open file, read line 1, parse JSON...").
+- 3-10 items is the sweet spot. Each item should be a milestone the user would recognize — something they can look at and think "good, it's making progress."
+- Write items from the user's perspective, not yours. Describe what each step achieves, not how you'll implement it internally. "Collect crypto market news" is good; "spawn sub-agent: collect info" is bad — the user doesn't know what spawning means and shouldn't need to.
+- A single-item plan defeats the purpose. If the progress bar jumps from 0% to 100% with nothing in between, the user gets zero visibility into what's happening.
 - Mark one item `in_progress` at a time. Move to `completed` when done.
 - Pass the COMPLETE items array every time — it's a full replacement, not a diff.
 - Use the `message` field for status notes ("Found 3 issues, fixing now").

@@ -48,9 +48,16 @@ Before creating the plan:
 - Once the plan is written, commit to executing it autonomously: do not stop mid-task to ask "shall I proceed?" or "is this okay?" — that is unnecessary and disruptive
 - Pause mid-execution ONLY for genuinely unexpected blockers that require a real decision (e.g. two fundamentally different approaches with no clear default, or a destructive action not covered by the original request). Everything else: make a reasonable assumption, note it in the \`message\` field, and keep going
 
+Writing good items:
+- The plan is shown directly to the user as a progress card in their chat. Write every item as something the user would recognize as a meaningful step toward their goal. Think "what would a project manager show the client?" not "what are my internal implementation steps?"
+- A single-item plan defeats the purpose — if the progress bar jumps from 0% to 100% with nothing in between, the user gets no visibility. Break work into the natural phases they'd expect.
+- Avoid exposing implementation mechanics like "spawn sub-agent", "call API", "parse JSON". Describe what each step achieves for the user, not how you achieve it internally.
+- 3-10 items is a good range. Each item should represent a milestone the user can look at and think "good, it's making progress" — not a line in a script.
+- Good: "Weekly report" → Gather data from sources → Analyze trends → Draft report → Format and send
+- Bad: "Weekly report" → Gather data, analyze, write, and send report (one giant item — user sees 0% then 100%)
+
 Best practices:
 - Create a plan at the START of complex work, before doing anything else
-- 3-10 items is a good range — keep them high-level, not step-by-step instructions
 - Update status as you complete each step (mark in_progress → completed)
 - Only one item should be in_progress at a time
 - Pass the COMPLETE items array every time (full replacement, not incremental)
