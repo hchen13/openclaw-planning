@@ -366,9 +366,10 @@ const plugin = {
             if (!channelNotificationSent) {
               const renderedCard = renderPlainText(plan, input.message);
               resultText += `\n\n<plan_card>\n${renderedCard}\n</plan_card>` +
-                `\nThe user has no live progress card on this channel. ` +
-                `Consider sending the <plan_card> above to the user before continuing with more tool calls — ` +
-                `otherwise they won't see any progress until your final reply.`;
+                `\nThis channel has no live progress card. The user can only see your plan when you send it as a message. ` +
+                `You don't need to send it after every plan_write — that would be noisy. ` +
+                `Good moments to show the card: when the plan is first created, after a major milestone, and when everything is done. ` +
+                `A few updates across a long task is enough to keep the user informed without flooding the chat.`;
             }
 
             return { content: [{ type: "text" as const, text: resultText }], details: undefined };
