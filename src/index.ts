@@ -366,9 +366,9 @@ const plugin = {
             if (!channelNotificationSent) {
               const renderedCard = renderPlainText(plan, input.message);
               resultText += `\n\n<plan_card>\n${renderedCard}\n</plan_card>` +
-                `\nNo dedicated progress card was sent on this channel. ` +
-                `Include the <plan_card> above in your next reply to the user — ` +
-                `output it verbatim as a progress update, then continue with your own message below it.`;
+                `\nThe user has no live progress card on this channel. ` +
+                `Consider sending the <plan_card> above to the user before continuing with more tool calls — ` +
+                `otherwise they won't see any progress until your final reply.`;
             }
 
             return { content: [{ type: "text" as const, text: resultText }], details: undefined };
