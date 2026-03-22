@@ -263,6 +263,7 @@ const plugin = {
             const notifyTarget = delegation?.conversationId
               ?? resolveNotificationTarget(sessionKey, ctx.agentAccountId, ctx.requesterSenderId);
             const effectiveAccountId = delegation?.agentAccountId ?? ctx.agentAccountId;
+            let channelNotificationSent = false;
 
             // Feishu card
             const creds = resolveFeishuCreds(ctx.config, effectiveAccountId);
@@ -297,12 +298,16 @@ const plugin = {
                   logger.warn?.(`planning: send card failed: ${err}`);
                 }
               }
+              channelNotificationSent = true;
             }
 
             // Telegram text message
             const tgToken = resolveTelegramToken(ctx.config, effectiveAccountId);
-            // Use stored chatId for edits; fall back to notifyTarget for new messages
-            const tgChatId = plan.telegram?.chatId ?? notifyTarget;
+            // Use stored chatId for edits; fall back to notifyTarget for new messages.
+            // Strip channel prefix (e.g. "telegram:5181221468" → "5181221468") since
+            // the Telegram Bot API requires a raw numeric chat_id.
+            const rawTgTarget = notifyTarget?.replace(/^telegram:/, "");
+            const tgChatId = plan.telegram?.chatId ?? rawTgTarget;
 
             if (channel === "telegram" && tgToken && tgChatId) {
               const text = renderPlainText(plan, input.message);
@@ -334,6 +339,7 @@ const plugin = {
                   logger.warn?.(`planning: Telegram send failed: ${err}`);
                 }
               }
+              channelNotificationSent = true;
             }
 
             // ── Result summary ──────────────────────────────────────────────
@@ -354,6 +360,16 @@ const plugin = {
             }
             if (latestPlan?.feishu?.messageId) resultText += ` (feishu card: ${latestPlan.feishu.messageId})`;
             if (latestPlan?.telegram?.messageId) resultText += ` (telegram msg: ${latestPlan.telegram.messageId})`;
+
+            // For channels without a dedicated notification (no card, no message edit),
+            // include the rendered plan in the tool result so the agent can relay it.
+            if (!channelNotificationSent) {
+              const renderedCard = renderPlainText(plan, input.message);
+              resultText += `\n\n<plan_card>\n${renderedCard}\n</plan_card>` +
+                `\nNo dedicated progress card was sent on this channel. ` +
+                `Include the <plan_card> above in your next reply to the user — ` +
+                `output it verbatim as a progress update, then continue with your own message below it.`;
+            }
 
             return { content: [{ type: "text" as const, text: resultText }], details: undefined };
           },
