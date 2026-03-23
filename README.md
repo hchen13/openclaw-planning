@@ -35,6 +35,7 @@ The card updates in real-time as the agent progresses. One card per plan, PATCHe
 - **System prompt injection** — active plans are injected every turn (adaptive: sparse when just updated, full when stale)
 - **Conversation-aware routing** — cards go to the correct chat (group or DM), not always the requester's DM
 - **Confirmation interception** — suppresses "shall I proceed?" when the agent has a plan and should just execute
+- **Promise-only turn guard** — in guarded modes, suppresses short task chatter that only states future intent without asking a real blocker question or starting work
 - **Cancellation support** — agents mark remaining items as `cancelled` when the user stops a task
 
 ## How It Works
@@ -199,6 +200,7 @@ Plan files are stored per-agent, per-session, per-plan:
 - **Telegram plain text only** — no `parse_mode`, so Markdown symbols render as-is
 - **Delegation requires same agentDir** — subagent plan delegation only works when parent and child share the same agent directory
 - **Subagent poke uses private API** — `enqueueSystemEvent` is not part of the formal Plugin SDK; may break on upgrades
+- **Promise-only recovery is best-effort** — when guarded modes suppress a promise-only update, the plugin can repoke the same session once, but that path also depends on the same private runtime API
 - **ConversationId fallback** — card routing to group chats depends on `conversationId` in the `message_received` hook; falls back to requester DM if unavailable
 
 ## Requirements

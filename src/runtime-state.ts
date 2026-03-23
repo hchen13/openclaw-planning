@@ -19,6 +19,32 @@ interface SessionState {
   hasActivePlan?: boolean;
   /** Conversation ID captured from message_received (for card routing). */
   conversationId?: string;
+  /** Current turn state for promise-only guard logic. */
+  currentTurn?: TurnState;
+  /** Consecutive hidden recovery pokes for this session. */
+  consecutivePromiseGuardRecoveries?: number;
+  /** Monotonic per-session turn counter. */
+  turnSeqCounter?: number;
+}
+
+export type TurnPromptKind =
+  | "unknown"
+  | "plan_available"
+  | "plan_reminder_sparse"
+  | "plan_reminder_full"
+  | "plan_reminder_delegated";
+
+export interface TurnState {
+  turnSeq: number;
+  startedAt: number;
+  promptKind: TurnPromptKind;
+  hasActivePlanAtStart: boolean;
+  planWrites: number;
+  actionToolCalls: number;
+  allToolCalls: string[];
+  askedBlockingQuestion: boolean;
+  sawSuppressedConfirmation: boolean;
+  suppressedPromiseText?: string;
 }
 
 const MAX_SESSIONS = 1000;
@@ -66,6 +92,92 @@ export function getIdleCount(sessionKey: string): number {
 
 export function getPlanDir(sessionKey: string): string | undefined {
   return sessions.get(sessionKey)?.planDir;
+}
+
+// ── Per-turn promise-guard state ────────────────────────────────────────────
+
+export function beginTurn(sessionKey: string): TurnState {
+  const s = getOrCreate(sessionKey);
+  const turnSeq = (s.turnSeqCounter ?? 0) + 1;
+  s.turnSeqCounter = turnSeq;
+  s.currentTurn = {
+    turnSeq,
+    startedAt: Date.now(),
+    promptKind: "unknown",
+    hasActivePlanAtStart: false,
+    planWrites: 0,
+    actionToolCalls: 0,
+    allToolCalls: [],
+    askedBlockingQuestion: false,
+    sawSuppressedConfirmation: false,
+  };
+  return s.currentTurn;
+}
+
+export function getCurrentTurn(sessionKey: string): TurnState | undefined {
+  return sessions.get(sessionKey)?.currentTurn;
+}
+
+export function setTurnPromptState(
+  sessionKey: string,
+  promptKind: TurnPromptKind,
+  hasActivePlan: boolean,
+): void {
+  const turn = getOrCreate(sessionKey).currentTurn;
+  if (!turn) return;
+  turn.promptKind = promptKind;
+  turn.hasActivePlanAtStart = hasActivePlan;
+}
+
+export function recordTurnToolCall(sessionKey: string, toolName: string): void {
+  const turn = getOrCreate(sessionKey).currentTurn;
+  if (!turn) return;
+  turn.allToolCalls.push(toolName);
+  if (toolName === "plan_write") {
+    turn.planWrites++;
+    return;
+  }
+  if (toolName === "message") return;
+  turn.actionToolCalls++;
+}
+
+export function markTurnAskedBlockingQuestion(sessionKey: string): void {
+  const turn = getOrCreate(sessionKey).currentTurn;
+  if (!turn) return;
+  turn.askedBlockingQuestion = true;
+}
+
+export function markTurnSuppressedConfirmation(sessionKey: string): void {
+  const turn = getOrCreate(sessionKey).currentTurn;
+  if (!turn) return;
+  turn.sawSuppressedConfirmation = true;
+}
+
+export function setSuppressedPromiseText(sessionKey: string, content: string): void {
+  const turn = getOrCreate(sessionKey).currentTurn;
+  if (!turn) return;
+  turn.suppressedPromiseText = content;
+}
+
+export function finishTurn(sessionKey: string): TurnState | undefined {
+  const s = getOrCreate(sessionKey);
+  const turn = s.currentTurn;
+  s.currentTurn = undefined;
+  return turn;
+}
+
+export function getConsecutivePromiseGuardRecoveries(sessionKey: string): number {
+  return sessions.get(sessionKey)?.consecutivePromiseGuardRecoveries ?? 0;
+}
+
+export function incrementConsecutivePromiseGuardRecoveries(sessionKey: string): number {
+  const s = getOrCreate(sessionKey);
+  s.consecutivePromiseGuardRecoveries = (s.consecutivePromiseGuardRecoveries ?? 0) + 1;
+  return s.consecutivePromiseGuardRecoveries;
+}
+
+export function resetConsecutivePromiseGuardRecoveries(sessionKey: string): void {
+  getOrCreate(sessionKey).consecutivePromiseGuardRecoveries = 0;
 }
 
 // ── Per-session agentDir (set by plan_write tool, read by before_prompt_build) ──

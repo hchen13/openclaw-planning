@@ -35,6 +35,7 @@
 - **系统提示注入** — 每轮注入活跃计划（自适应：刚更新时简洁，过期时完整+警告）
 - **会话感知路由** — 卡片发送到正确的聊天（群聊或私聊），而非始终发到请求者私聊
 - **确认拦截** — agent 有计划时抑制"要继续吗？"类消息
+- **空承诺回合拦截** — 在 guarded mode 下，抑制只表达“接下来会做什么”但既没提出真实阻塞问题、也没开始执行的短消息
 - **取消支持** — 用户叫停时，agent 将剩余项标记为 `cancelled`
 
 ## 工作原理
@@ -199,6 +200,7 @@ src/
 - **Telegram 仅纯文本** — 未使用 `parse_mode`，Markdown 符号原样显示
 - **委托要求相同 agentDir** — 子 agent 计划委托仅在父子共享同一 agent 目录时有效
 - **子 agent 通知使用私有 API** — `enqueueSystemEvent` 不属于正式的 Plugin SDK，升级后可能失效
+- **空承诺恢复是 best-effort** — guarded mode 抑制 promise-only 更新后，插件最多会对同一 session 触发一次隐藏 repoke，但这条恢复路径同样依赖私有 runtime API
 - **conversationId 回退** — 卡片路由到群聊依赖 `message_received` 钩子中的 `conversationId`；不可用时回退到请求者私聊
 
 ## 环境要求

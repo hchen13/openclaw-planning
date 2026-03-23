@@ -37,9 +37,18 @@ import { sendCard, updateCard, normalizeTargetId } from "./feishu-client.js";
 import { resolveTelegramToken, sendMessageTg, editMessageTg } from "./telegram-client.js";
 import {
   recordToolCall,
+  beginTurn,
+  finishTurn,
+  getConsecutivePromiseGuardRecoveries,
+  getCurrentTurn,
   setSessionMeta,
   getIdleCount,
   getPlanDir,
+  incrementConsecutivePromiseGuardRecoveries,
+  markTurnAskedBlockingQuestion,
+  markTurnSuppressedConfirmation,
+  recordTurnToolCall,
+  resetConsecutivePromiseGuardRecoveries,
   setAgentActivePlan,
   getAgentActivePlan,
   setSessionActivePlan,
@@ -48,10 +57,13 @@ import {
   getSessionAgentDir,
   setSessionConversationId,
   getSessionConversationId,
+  setSuppressedPromiseText,
+  setTurnPromptState,
   setAccountConversationId,
   getAccountConversationId,
   setPlanDelegation,
   getPlanDelegation,
+  type TurnState,
 } from "./runtime-state.js";
 import type { PlanWriteInput } from "./types.js";
 
@@ -64,6 +76,40 @@ const STALE_THRESHOLD = 8;
 const SUBAGENT_POKE_DELAY_MS = 5_000;
 /** Max content length to consider as a standalone confirmation message. */
 const CONFIRMATION_MAX_LEN = 200;
+/** Rollout mode for promise-only turn guard. */
+type PromiseGuardMode = "off" | "observe" | "enforce_active_plan" | "enforce_task_turn";
+const PROMISE_GUARD_MODE: PromiseGuardMode = "observe";
+const PROMISE_GUARD_MAX_LEN = 240;
+const PROMISE_GUARD_MAX_CONSECUTIVE_REPOKES = 1;
+const PROMISE_GUARD_RECOVERY_PROMPT = `[planning] Your previous user-visible message was suppressed because it stated intent without action.
+Continue this task now.
+Do exactly one of:
+1. ask a blocking question
+2. call plan_write
+3. call an execution tool
+Do not send another promise-only update.`;
+
+const BLOCKING_QUESTION_PATTERNS = [
+  /(?:是否|还是|优先|想确认|确认一下|需要确认|先确认|你更想|要不要|可以吗|行不行|要哪个)/,
+  /\b(should|which|what scope|what kind|do you want|would you like|can you confirm|which one|whether)\b/i,
+];
+
+const PROMISE_FUTURE_PATTERNS = [
+  /我(会|先|去|来|接下来|现在就|马上)/,
+  /我这边先/,
+  /我先.*再/,
+  /接下来我会/,
+  /\b(i will|i'?ll|let me|i am going to|next i will|next i'?ll)\b/i,
+];
+
+const PROMISE_ACK_PATTERNS = [
+  /^(?:收到|明白|好|好的|可以|行|了解|嗯|对)(?:[\s,，。!！?？:]|$)|^(?:ok|okay|got it|understood|alright)\b/i,
+  /^(那我|我这边|接下来|next|then i)\b/i,
+  /^(我(会|先|去|来|接下来|现在就|马上)|我这边先|我先.*再|接下来我会)/,
+  /^(i will|i'?ll|i am going to|let me|next i will|next i'?ll)\b/i,
+];
+
+const missingSessionKeyLogCache = new Map<string, number>();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +156,113 @@ function isUnnecessaryConfirmation(content: string): boolean {
     /do you want me to continue/i,
   ];
   return patterns.some((p) => p.test(content));
+}
+
+function normalizeGuardContent(content: string): string {
+  return content
+    .trim()
+    .replace(/^\[\[reply_to_current\]\]\s*/i, "")
+    .replaceAll("’", "'")
+    .replace(/\s+/g, " ");
+}
+
+function looksLikeBlockingQuestion(content: string): boolean {
+  const normalized = normalizeGuardContent(content);
+  if (!normalized || normalized.length > PROMISE_GUARD_MAX_LEN) return false;
+  if (!normalized.includes("?") && !normalized.includes("？")) return false;
+  return BLOCKING_QUESTION_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function hasCompletedResultMarkers(content: string): boolean {
+  return (
+    content.includes("```") ||
+    content.includes("\n- ") ||
+    content.includes("\n1. ") ||
+    /`[^`\n]+`/.test(content) ||
+    content.includes("/Users/")
+  );
+}
+
+function looksLikePromiseOnlyMessage(content: string): boolean {
+  const normalized = normalizeGuardContent(content);
+  if (!normalized || normalized.length > PROMISE_GUARD_MAX_LEN) return false;
+  if (hasCompletedResultMarkers(content)) return false;
+  if (looksLikeBlockingQuestion(content)) return false;
+  const matchesFuture = PROMISE_FUTURE_PATTERNS.some((pattern) => pattern.test(normalized));
+  const matchesAck = PROMISE_ACK_PATTERNS.some((pattern) => pattern.test(normalized));
+  return matchesFuture && matchesAck;
+}
+
+function isTaskLikeTurn(turn: TurnState): boolean {
+  switch (PROMISE_GUARD_MODE) {
+    case "off":
+      return false;
+    case "observe":
+    case "enforce_active_plan":
+      return turn.hasActivePlanAtStart === true;
+    case "enforce_task_turn":
+      return turn.hasActivePlanAtStart === true || turn.promptKind === "plan_available";
+    default:
+      return false;
+  }
+}
+
+function shouldSuppressPromiseOnlyMessage(content: string, turn?: TurnState): boolean {
+  return Boolean(
+    turn &&
+    isTaskLikeTurn(turn) &&
+    turn.planWrites === 0 &&
+    turn.actionToolCalls === 0 &&
+    turn.askedBlockingQuestion === false &&
+    looksLikePromiseOnlyMessage(content),
+  );
+}
+
+function shouldRecoverFromPromiseOnlyEnd(turn: TurnState, sessionKey: string): boolean {
+  return Boolean(
+    turn.suppressedPromiseText &&
+    turn.planWrites === 0 &&
+    turn.actionToolCalls === 0 &&
+    turn.askedBlockingQuestion === false &&
+    getConsecutivePromiseGuardRecoveries(sessionKey) < PROMISE_GUARD_MAX_CONSECUTIVE_REPOKES,
+  );
+}
+
+function truncateForLog(content: string): string {
+  const normalized = normalizeGuardContent(content);
+  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+}
+
+function buildPromiseGuardLog(
+  eventName: string,
+  payload: {
+    sessionKey?: string;
+    agentId?: string;
+    turn?: TurnState;
+    content?: string;
+  },
+): string {
+  const detail = {
+    sessionKey: payload.sessionKey,
+    agentId: payload.agentId,
+    turnSeq: payload.turn?.turnSeq,
+    mode: PROMISE_GUARD_MODE,
+    toolCalls: payload.turn?.allToolCalls ?? [],
+    planWrites: payload.turn?.planWrites,
+    askedBlockingQuestion: payload.turn?.askedBlockingQuestion,
+    promptKind: payload.turn?.promptKind,
+    content: payload.content ? truncateForLog(payload.content) : undefined,
+  };
+  return `${eventName} ${JSON.stringify(detail)}`;
+}
+
+function shouldLogMissingSessionKey(accountId?: string, conversationId?: string): boolean {
+  const key = `${accountId ?? "unknown"}:${conversationId ?? "unknown"}`;
+  const now = Date.now();
+  const prev = missingSessionKeyLogCache.get(key) ?? 0;
+  if (now - prev < 5_000) return false;
+  missingSessionKeyLogCache.set(key, now);
+  return true;
 }
 
 /**
@@ -382,6 +535,7 @@ const plugin = {
     // ── before_prompt_build Hook ─────────────────────────────────────────────
     api.on("before_prompt_build", async (_event: unknown, ctx: any) => {
       const sessionKey: string | undefined = ctx?.sessionKey;
+      if (sessionKey) beginTurn(sessionKey);
       const sessionId: string | undefined = ctx?.sessionId;
       const agentId: string | undefined = ctx?.agentId;
       // Prefer agentDir recorded by plan_write (authoritative).
@@ -418,12 +572,15 @@ const plugin = {
         if (delegation) {
           // Delegated subagent — show parent's plans with delegation instructions
           reminder = buildDelegatedPlanReminder(activePlans, stale);
+          if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_delegated", true);
         } else if (idleCount < SPARSE_THRESHOLD) {
           // Just updated — short reminder to save tokens
           reminder = buildPlanReminderSparse(activePlans);
+          if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_sparse", true);
         } else {
           // Normal or stale — full reminder
           reminder = buildPlanReminder(activePlans, stale);
+          if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_full", true);
         }
 
         return { prependContext: reminder };
@@ -432,6 +589,7 @@ const plugin = {
       // No active plan
       if (agentId) setAgentActivePlan(agentId, false);
       if (sessionKey) setSessionActivePlan(sessionKey, false);
+      if (sessionKey) setTurnPromptState(sessionKey, "plan_available", false);
       return { prependContext: buildPlanAvailable() };
     });
 
@@ -472,6 +630,7 @@ const plugin = {
       if (!sessionKey) return;
       const toolName: string = event?.toolName ?? ctx?.toolName ?? "";
       recordToolCall(sessionKey, toolName);
+      recordTurnToolCall(sessionKey, toolName);
     });
 
     // ── subagent_ended Hook ──────────────────────────────────────────────────
@@ -574,23 +733,157 @@ const plugin = {
       // Prefer per-session check; fall back to agent-level for contexts without sessionKey
       const sessionKey: string = ctx?.sessionKey ?? "";
       const accountId: string = ctx?.accountId ?? "";
+      const agentId: string = ctx?.agentId ?? accountId ?? "";
+      const turn = sessionKey ? getCurrentTurn(sessionKey) : undefined;
 
       if (!content) return;
-      const hasActivePlan = sessionKey
+      if (content === "NO_REPLY") return;
+      const hasActivePlanForConfirmation = sessionKey
         ? getSessionActivePlan(sessionKey)
-        : (accountId ? getAgentActivePlan(accountId) : false);
-      if (!hasActivePlan) return; // No active plan — don't interfere
-      if (content.length > CONFIRMATION_MAX_LEN) return; // Long message likely has real value
+        : (agentId ? getAgentActivePlan(agentId) : false);
 
-      if (isUnnecessaryConfirmation(content)) {
-        logger.info?.(`planning: blocked unnecessary confirmation from agent "${accountId}"`);
+      if (
+        hasActivePlanForConfirmation &&
+        content.length <= CONFIRMATION_MAX_LEN &&
+        isUnnecessaryConfirmation(content)
+      ) {
+        if (sessionKey) markTurnSuppressedConfirmation(sessionKey);
+        logger.info?.(`planning: blocked unnecessary confirmation from agent "${agentId}"`);
         return { cancel: true };
+      }
+
+      if (!sessionKey) {
+        if (shouldLogMissingSessionKey(accountId, ctx?.conversationId)) {
+          logger.info?.(
+            buildPromiseGuardLog("planning.promise_guard.session_key_missing", {
+              agentId,
+              content,
+            }),
+          );
+        }
+        return;
+      }
+      if (looksLikeBlockingQuestion(content)) {
+        markTurnAskedBlockingQuestion(sessionKey);
+        return;
+      }
+
+      if (!shouldSuppressPromiseOnlyMessage(content, turn)) return;
+
+      logger.info?.(
+        buildPromiseGuardLog("planning.promise_guard.detected", {
+          sessionKey,
+          agentId,
+          turn,
+          content,
+        }),
+      );
+
+      if (PROMISE_GUARD_MODE === "observe") {
+        logger.info?.(
+          buildPromiseGuardLog("planning.promise_guard.observe_only", {
+            sessionKey,
+            agentId,
+            turn,
+            content,
+          }),
+        );
+        return;
+      }
+
+      setSuppressedPromiseText(sessionKey, content);
+      logger.info?.(
+        buildPromiseGuardLog("planning.promise_guard.suppressed", {
+          sessionKey,
+          agentId,
+          turn,
+          content,
+        }),
+      );
+      return { cancel: true };
+    });
+
+    api.on("agent_end", async (_event: any, ctx: any) => {
+      const sessionKey: string | undefined = ctx?.sessionKey;
+      if (!sessionKey) return;
+
+      const finishedTurn = finishTurn(sessionKey);
+      if (!finishedTurn) return;
+
+      if (!shouldRecoverFromPromiseOnlyEnd(finishedTurn, sessionKey)) {
+        resetConsecutivePromiseGuardRecoveries(sessionKey);
+        return;
+      }
+
+      const agentId: string | undefined = ctx?.agentId;
+      if (PROMISE_GUARD_MODE === "observe") {
+        logger.info?.(
+          buildPromiseGuardLog("planning.promise_guard.observe_only", {
+            sessionKey,
+            agentId,
+            turn: finishedTurn,
+            content: finishedTurn.suppressedPromiseText,
+          }),
+        );
+        return;
+      }
+
+      if (
+        getConsecutivePromiseGuardRecoveries(sessionKey) >=
+        PROMISE_GUARD_MAX_CONSECUTIVE_REPOKES
+      ) {
+        logger.info?.(
+          buildPromiseGuardLog("planning.promise_guard.repoke_exhausted", {
+            sessionKey,
+            agentId,
+            turn: finishedTurn,
+            content: finishedTurn.suppressedPromiseText,
+          }),
+        );
+        return;
+      }
+
+      try {
+        const enqueue = (api as any).runtime?.system?.enqueueSystemEvent?.bind(
+          (api as any).runtime?.system,
+        );
+        if (!enqueue) {
+          logger.warn?.(
+            buildPromiseGuardLog("planning.promise_guard.repoke_unavailable", {
+              sessionKey,
+              agentId,
+              turn: finishedTurn,
+              content: finishedTurn.suppressedPromiseText,
+            }),
+          );
+          return;
+        }
+
+        enqueue(PROMISE_GUARD_RECOVERY_PROMPT, { sessionKey });
+        incrementConsecutivePromiseGuardRecoveries(sessionKey);
+        logger.info?.(
+          buildPromiseGuardLog("planning.promise_guard.repoke", {
+            sessionKey,
+            agentId,
+            turn: finishedTurn,
+            content: finishedTurn.suppressedPromiseText,
+          }),
+        );
+      } catch (err) {
+        logger.warn?.(
+          `${buildPromiseGuardLog("planning.promise_guard.repoke_unavailable", {
+            sessionKey,
+            agentId,
+            turn: finishedTurn,
+            content: finishedTurn.suppressedPromiseText,
+          })} error=${String(err)}`,
+        );
       }
     });
 
     logger.info?.(
       "planning: plugin registered " +
-      "(plan_write + before_prompt_build + after_tool_call + subagent_ended + subagent_spawned + message_received + message_sending)"
+      "(plan_write + before_prompt_build + after_tool_call + subagent_ended + subagent_spawned + message_received + message_sending + agent_end)"
     );
   },
 };

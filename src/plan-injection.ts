@@ -81,6 +81,9 @@ ${header}${body}${staleWarning}
 Update plan_write when you complete a step or the plan changes.
 Mark items in_progress when starting, completed when done.
 Execute autonomously — do not stop to ask "shall I proceed?" or "is this okay?". Only pause for genuinely unexpected blockers requiring a real decision.
+If you say what you will do next, do it in this same turn.
+Do not end a work turn with a promise-only update.
+Allowed no-action outputs: a blocking question, or a completed answer.
 </plan_reminder>`;
 }
 
@@ -117,6 +120,9 @@ export function buildPlanAvailable(): string {
 plan_write is available. Use it before any multi-step work — even linear tasks. A plan keeps you on track across tool calls and context compaction, and shows the user what's happening instead of leaving them waiting blind.
 Multiple concurrent plans are supported — use different titles for unrelated tasks arriving mid-work.
 Workflow: ask all clarifying questions upfront (before the plan), then execute the plan autonomously without stopping to confirm each step.
+If you say what you will do next, do it in this same turn.
+Do not end a work turn with a promise-only update.
+Allowed no-action outputs: a blocking question, or a completed answer.
 </plan_available>`;
 }
 
@@ -137,6 +143,9 @@ You are a sub-agent. The parent task has active plans — update them using plan
 ${sections}${staleWarning}
 Mark items in_progress when starting, completed when done.
 Execute autonomously — do not stop to ask "shall I proceed?".
+If you say what you will do next, do it in this same turn.
+Do not end a work turn with a promise-only update.
+Allowed no-action outputs: a blocking question, or a completed answer.
 </plan_reminder>`;
 }
 
