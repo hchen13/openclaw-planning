@@ -3,7 +3,8 @@
 # OpenClaw Planning Plugin
 
 <p align="center">
-  <img src="assets/demo.gif" alt="Planning Plugin Demo" />
+  <img src="assets/demo.gif" alt="Planning Plugin Demo — Feishu" />
+  <img src="assets/demo-telegram.gif" alt="Planning Plugin Demo — Telegram" />
 </p>
 
 **The problem:** When an AI agent runs a 20-step task on a messaging platform, the user stares at a blank chat for minutes. There's no progress bar, no status update, no way to know if the agent is stuck or just thinking. When the agent spawns sub-agents, it gets worse — the user has zero visibility into what might be a 10-minute background operation. And if context gets compacted mid-task, the agent forgets what it was doing.

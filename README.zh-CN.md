@@ -3,7 +3,8 @@
 # OpenClaw Planning 插件
 
 <p align="center">
-  <img src="assets/demo.gif" alt="Planning 插件演示" />
+  <img src="assets/demo.gif" alt="Planning 插件演示 — 飞书" />
+  <img src="assets/demo-telegram.gif" alt="Planning 插件演示 — Telegram" />
 </p>
 
 **问题：** 当 AI agent 在消息平台上执行一个 20 步的任务时，用户盯着空白聊天窗口等好几分钟。没有进度条，没有状态更新，不知道 agent 是卡住了还是在思考。当 agent spawn 子 agent 时更糟——用户对一个可能持续 10 分钟的后台操作完全没有可见性。而如果上下文在任务中途被压缩，agent 会忘记自己在做什么。
