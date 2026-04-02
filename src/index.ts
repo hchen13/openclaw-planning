@@ -32,6 +32,7 @@ import {
   isPlanActive,
   renderFeishuCard,
   renderPlainText,
+  FOLLOW_THROUGH_RULES,
 } from "./plan-injection.js";
 import { sendCard, updateCard, normalizeTargetId } from "./feishu-client.js";
 import { resolveTelegramToken, sendMessageTg, editMessageTg } from "./telegram-client.js";
@@ -78,7 +79,7 @@ const SUBAGENT_POKE_DELAY_MS = 5_000;
 const CONFIRMATION_MAX_LEN = 200;
 /** Rollout mode for promise-only turn guard. */
 type PromiseGuardMode = "off" | "observe" | "enforce_active_plan" | "enforce_task_turn";
-const PROMISE_GUARD_MODE: PromiseGuardMode = "observe";
+const PROMISE_GUARD_MODE: PromiseGuardMode = "enforce_active_plan";
 const PROMISE_GUARD_MAX_LEN = 240;
 const PROMISE_GUARD_MAX_CONSECUTIVE_REPOKES = 1;
 const PROMISE_GUARD_RECOVERY_PROMPT = `[planning] Your previous user-visible message was suppressed because it stated intent without action.
@@ -88,6 +89,14 @@ Do exactly one of:
 2. call plan_write
 3. call an execution tool
 Do not send another promise-only update.`;
+
+const PROMISE_GUARD_STREAMING_RECOVERY_PROMPT = `[planning] Your previous message stated intent without taking action.
+Your message was delivered, but you must follow through now.
+Do exactly one of:
+1. ask a blocking question
+2. call plan_write
+3. call an execution tool
+Do not end this turn without a concrete action.`;
 
 const BLOCKING_QUESTION_PATTERNS = [
   /(?:是否|还是|优先|想确认|确认一下|需要确认|先确认|你更想|要不要|可以吗|行不行|要哪个)/,
@@ -583,14 +592,14 @@ const plugin = {
           if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_full", true);
         }
 
-        return { prependContext: reminder };
+        return { prependContext: reminder, appendSystemContext: FOLLOW_THROUGH_RULES };
       }
 
       // No active plan
       if (agentId) setAgentActivePlan(agentId, false);
       if (sessionKey) setSessionActivePlan(sessionKey, false);
       if (sessionKey) setTurnPromptState(sessionKey, "plan_available", false);
-      return { prependContext: buildPlanAvailable() };
+      return { prependContext: buildPlanAvailable(), appendSystemContext: FOLLOW_THROUGH_RULES };
     });
 
     // ── before_tool_call Hook ────────────────────────────────────────────────
@@ -770,6 +779,8 @@ const plugin = {
 
       if (!shouldSuppressPromiseOnlyMessage(content, turn)) return;
 
+      const isStreaming = event?.metadata?.streaming === true;
+
       logger.info?.(
         buildPromiseGuardLog("planning.promise_guard.detected", {
           sessionKey,
@@ -782,6 +793,21 @@ const plugin = {
       if (PROMISE_GUARD_MODE === "observe") {
         logger.info?.(
           buildPromiseGuardLog("planning.promise_guard.observe_only", {
+            sessionKey,
+            agentId,
+            turn,
+            content,
+          }),
+        );
+        return;
+      }
+
+      // Streaming cards are already visible to the user — cannot cancel.
+      // Mark for recovery so agent_end triggers a follow-through repoke.
+      if (isStreaming) {
+        setSuppressedPromiseText(sessionKey, content, { streaming: true });
+        logger.info?.(
+          buildPromiseGuardLog("planning.promise_guard.streaming_passthrough", {
             sessionKey,
             agentId,
             turn,
@@ -859,7 +885,10 @@ const plugin = {
           return;
         }
 
-        enqueue(PROMISE_GUARD_RECOVERY_PROMPT, { sessionKey });
+        const recoveryPrompt = finishedTurn.promiseWasStreaming
+          ? PROMISE_GUARD_STREAMING_RECOVERY_PROMPT
+          : PROMISE_GUARD_RECOVERY_PROMPT;
+        enqueue(recoveryPrompt, { sessionKey });
         incrementConsecutivePromiseGuardRecoveries(sessionKey);
         logger.info?.(
           buildPromiseGuardLog("planning.promise_guard.repoke", {

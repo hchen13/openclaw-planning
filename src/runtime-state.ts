@@ -45,6 +45,8 @@ export interface TurnState {
   askedBlockingQuestion: boolean;
   sawSuppressedConfirmation: boolean;
   suppressedPromiseText?: string;
+  /** When true, the promise-only message was delivered via streaming (not suppressed). */
+  promiseWasStreaming?: boolean;
 }
 
 const MAX_SESSIONS = 1000;
@@ -153,10 +155,15 @@ export function markTurnSuppressedConfirmation(sessionKey: string): void {
   turn.sawSuppressedConfirmation = true;
 }
 
-export function setSuppressedPromiseText(sessionKey: string, content: string): void {
+export function setSuppressedPromiseText(
+  sessionKey: string,
+  content: string,
+  opts?: { streaming?: boolean },
+): void {
   const turn = getOrCreate(sessionKey).currentTurn;
   if (!turn) return;
   turn.suppressedPromiseText = content;
+  if (opts?.streaming) turn.promiseWasStreaming = true;
 }
 
 export function finishTurn(sessionKey: string): TurnState | undefined {

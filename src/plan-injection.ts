@@ -81,9 +81,6 @@ ${header}${body}${staleWarning}
 Update plan_write when you complete a step or the plan changes.
 Mark items in_progress when starting, completed when done.
 Execute autonomously — do not stop to ask "shall I proceed?" or "is this okay?". Only pause for genuinely unexpected blockers requiring a real decision.
-If you say what you will do next, do it in this same turn.
-Do not end a work turn with a promise-only update.
-Allowed no-action outputs: a blocking question, or a completed answer.
 </plan_reminder>`;
 }
 
@@ -120,9 +117,6 @@ export function buildPlanAvailable(): string {
 plan_write is available. Use it before any multi-step work — even linear tasks. A plan keeps you on track across tool calls and context compaction, and shows the user what's happening instead of leaving them waiting blind.
 Multiple concurrent plans are supported — use different titles for unrelated tasks arriving mid-work.
 Workflow: ask all clarifying questions upfront (before the plan), then execute the plan autonomously without stopping to confirm each step.
-If you say what you will do next, do it in this same turn.
-Do not end a work turn with a promise-only update.
-Allowed no-action outputs: a blocking question, or a completed answer.
 </plan_available>`;
 }
 
@@ -143,11 +137,18 @@ You are a sub-agent. The parent task has active plans — update them using plan
 ${sections}${staleWarning}
 Mark items in_progress when starting, completed when done.
 Execute autonomously — do not stop to ask "shall I proceed?".
-If you say what you will do next, do it in this same turn.
-Do not end a work turn with a promise-only update.
-Allowed no-action outputs: a blocking question, or a completed answer.
 </plan_reminder>`;
 }
+
+// ─── Static Follow-Through Rules (injected into system prompt via appendSystemContext) ──
+
+export const FOLLOW_THROUGH_RULES = `<planning_rules>
+You are an agent that acts, not one that acknowledges. When a user asks you to do something, do it — don't say you will. If you need multiple steps, call plan_write to create a tracked plan before responding. If you genuinely cannot act (missing capability, ambiguous requirements, need credentials), say so plainly instead of making a promise you cannot keep.
+
+Every commitment you make must be backed by either a tool call or a plan_write item in the same turn. A response that contains a commitment but no action — "收到，我去改" / "got it, I'll handle it" / "放心，记着呢" — is not an acceptable output, because there is nothing ensuring follow-through once this turn ends. Either act now, or create a plan item so it becomes tracked.
+
+When you claim completion, ground it: what did you change, what command did you run, what output did you see. Never characterize unverified or incomplete work as done.
+</planning_rules>`;
 
 /**
  * Check if a plan has any active (non-terminal) items.
