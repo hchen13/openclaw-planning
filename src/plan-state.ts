@@ -141,8 +141,6 @@ export function buildPlan(
       const changed = !prev || prev.status !== item.status || prev.content !== item.content || prev.activeForm !== item.activeForm;
       return {
         ...item,
-        // Preserve runtime-only field written by the plugin (not agent-provided)
-        assignedChildSession: prev?.assignedChildSession,
         createdAt: prev?.createdAt ?? now,
         updatedAt: changed ? now : (prev?.updatedAt ?? now),
       };

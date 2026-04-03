@@ -74,6 +74,7 @@ import {
   getOrchestratedBinding,
   setManagedStatus,
   getManagedStatus,
+  deleteManagedStatus,
   clearManagedStatuses,
   type TurnState,
 } from "./runtime-state.js";
@@ -408,6 +409,13 @@ const plugin = {
               return { content: [{ type: "text" as const, text: `Plan "${input.title}" cleared.` }], details: undefined };
             }
 
+            // Coerce empty-string agentTask to undefined (not a valid subagent prompt)
+            for (const item of input.items) {
+              if (item.agentTask !== undefined && !item.agentTask.trim()) {
+                item.agentTask = undefined;
+              }
+            }
+
             // ── Auto-assign item IDs ──────────────────────────────────────
             // Items without an ID get one auto-generated. Existing items (updates)
             // keep their ID from the previous version, matched by content.
@@ -484,8 +492,8 @@ const plugin = {
                 const managed = getManagedStatus(parentSessionKey, input.title, item.id);
                 if (managed && managed !== item.status) {
                   if (item.status === "pending") {
-                    // Agent wants to retry — clear managed status
-                    setManagedStatus(parentSessionKey, input.title, item.id, "pending");
+                    // Agent wants to retry — delete managed status so it no longer overrides
+                    deleteManagedStatus(parentSessionKey, input.title, item.id!);
                     logger.info?.(`planning: cleared managed status for item "${item.id}" (agent retry)`);
                   } else {
                     logger.info?.(`planning: enforcing managed status for item "${item.id}": ${item.status} → ${managed}`);
@@ -852,14 +860,22 @@ const plugin = {
       if (!parentPlans.some((p) => isPlanActive(p))) return;
 
       // ── Check for orchestrated dispatch (label matches an item ID with agentTask) ──
-      const label: string | undefined = event?.label;
-      if (label) {
+      // Label format: "itemId" or "planTitle:itemId" (the latter disambiguates across concurrent plans)
+      const rawLabel: string | undefined = event?.label;
+      if (rawLabel) {
+        const colonIdx = rawLabel.indexOf(":");
+        const labelPlanTitle = colonIdx >= 0 ? rawLabel.slice(0, colonIdx) : undefined;
+        const labelItemId = colonIdx >= 0 ? rawLabel.slice(colonIdx + 1) : rawLabel;
+
         for (const plan of parentPlans) {
+          // If label includes a plan title prefix, skip non-matching plans
+          if (labelPlanTitle && plan.title !== labelPlanTitle) continue;
+
           // Apply managedStatus to get true item status before matching
           const effectiveStatus = (item: typeof plan.items[0]) =>
             getManagedStatus(parentSessionKey, plan.title, item.id) ?? item.status;
           const matchedItem = plan.items.find(
-            (item) => item.id === label && item.agentTask,
+            (item) => item.id === labelItemId && item.agentTask,
           );
           if (matchedItem) {
             // Guard: skip if item is already in_progress or terminal (prevents duplicate dispatch)

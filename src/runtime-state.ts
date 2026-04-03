@@ -323,6 +323,10 @@ export function getManagedStatus(
   return managedStatuses.get(managedStatusKey(sessionKey, planTitle, itemId));
 }
 
+export function deleteManagedStatus(sessionKey: string, planTitle: string, itemId: string): void {
+  managedStatuses.delete(managedStatusKey(sessionKey, planTitle, itemId));
+}
+
 export function clearManagedStatuses(sessionKey: string, planTitle: string): void {
   const prefix = `${sessionKey}:${planTitle}:`;
   for (const key of managedStatuses.keys()) {

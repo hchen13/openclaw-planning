@@ -13,8 +13,6 @@ export interface PlanItem {
   blockedBy?: string[];
   /** Self-contained prompt for the subagent executing this item. */
   agentTask?: string;
-  /** Runtime-only: child session key assigned by the plugin during orchestrated dispatch. */
-  assignedChildSession?: string;
   createdAt: number;
   updatedAt: number;
 }

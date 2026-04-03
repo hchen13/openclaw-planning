@@ -219,12 +219,19 @@ export function buildOrchestrationDirective(plans: PlanFile[]): string | null {
   // Nothing to orchestrate
   if (readyItems.length === 0 && runningItems.length === 0 && blockedItems.length === 0 && deadlockedItems.length === 0) return null;
 
+  // When multiple plans have orchestrated items, use "planTitle:itemId" labels to disambiguate
+  const orchestratedPlanCount = plans.filter(hasOrchestratedItems).length;
+  const needsQualifiedLabel = orchestratedPlanCount > 1;
+  const labelFor = (item: { planTitle: string; id: string }) =>
+    needsQualifiedLabel ? `${item.planTitle}:${item.id}` : item.id;
+
   const lines: string[] = [];
 
   if (readyItems.length > 0) {
     lines.push("Ready to dispatch (no blockers — spawn subagents now):");
     for (const item of readyItems) {
-      lines.push(`  → ${item.id}: "${item.content}" — use sessions_spawn with label="${item.id}"`);
+      const label = labelFor(item);
+      lines.push(`  → ${item.id}: "${item.content}" — use sessions_spawn with label="${label}"`);
     }
     if (readyItems.length > 1) {
       lines.push(`Spawn all ${readyItems.length} ready items in a single turn for parallel execution.`);
