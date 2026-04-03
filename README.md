@@ -30,13 +30,15 @@ The card updates in real-time as the agent progresses. One card per plan, PATCHe
 ## Core Capabilities
 
 - **`plan_write` tool** — agents create and update task plans with status tracking (pending → in_progress → completed/cancelled/failed)
-- **Multiple concurrent plans** — unrelated tasks arriving mid-work get separate plans with separate cards
-- **Subagent plan delegation** — sub-agents automatically update the parent's plan and card, not their own
+- **Orchestrated execution** — plan items can be dispatched to individual subagents with dependency tracking, parallel execution for independent items, and automatic progress updates
+- **Dependency management** — items declare dependencies via `blockedBy`; the plugin validates the dependency graph and coordinates dispatch order
+- **Multiple concurrent plans** — unrelated tasks arriving mid-work get separate plans with separate cards, each orchestrated independently
+- **Subagent plan delegation** — for non-orchestrated items, sub-agents automatically update the parent's plan and card
 - **Spawn gating** — `sessions_spawn` is blocked until a plan exists, ensuring user visibility before long background operations
-- **System prompt injection** — active plans are injected every turn (adaptive: sparse when just updated, full when stale)
+- **System prompt injection** — active plans and follow-through behavioral rules are injected every turn (adaptive: sparse when just updated, full when stale)
 - **Conversation-aware routing** — cards go to the correct chat (group or DM), not always the requester's DM
 - **Confirmation interception** — suppresses "shall I proceed?" when the agent has a plan and should just execute
-- **Promise-only turn guard** — in guarded modes, suppresses short task chatter that only states future intent without asking a real blocker question or starting work
+- **Promise-only turn guard** — detects and handles messages that only state future intent without action
 - **Cancellation support** — agents mark remaining items as `cancelled` when the user stops a task
 
 ## How It Works
@@ -51,9 +53,9 @@ Agent receives task
   → deliver final result
 ```
 
-### Subagent Delegation
+### Subagent Delegation (Manual Mode)
 
-When an agent spawns a sub-agent:
+When an agent spawns a sub-agent without orchestration:
 
 ```
 Agent creates plan → spawns sub-agent
@@ -63,7 +65,28 @@ Agent creates plan → spawns sub-agent
   → parent resumes and can continue updating the same plan
 ```
 
-The agent MUST create a plan before spawning — `sessions_spawn` is blocked otherwise. This ensures the user always sees what's happening, and cancellation works cleanly.
+### Orchestrated Execution
+
+When plan items have `agentTask` fields, the plugin enters orchestrated mode:
+
+```
+Agent creates plan with agentTask + blockedBy
+  → plugin injects <orchestration_directive> showing ready items
+  → agent spawns one subagent per ready item (label = item ID)
+  → plugin auto-binds subagent to item, marks in_progress
+  → subagent completes → plugin auto-marks completed
+  → plugin checks for newly unblocked items → injects updated directive
+  → agent dispatches next batch (parallel if independent)
+  → all items done → agent summarizes results
+```
+
+Key differences from manual mode:
+- Orchestrated subagents do NOT get plan delegation — the plugin manages their status
+- Independent items can run in parallel (agent spawns multiple subagents in one turn)
+- Dependencies are enforced: items with unresolved `blockedBy` cannot be dispatched
+- Failed dependencies trigger deadlock detection with explicit decision prompts
+
+The agent MUST create a plan before spawning — `sessions_spawn` is blocked otherwise.
 
 ### System Prompt Injection
 
@@ -180,12 +203,12 @@ Per-agent accounts supported via `channels.telegram.accounts.{agentAccountId}.bo
 
 ```
 src/
-├── index.ts              # Plugin entry — registers tool + 8 hooks
+├── index.ts              # Plugin entry — registers tool + 9 hooks
 ├── types.ts              # Core types: PlanFile, PlanItem, PlanStatus
 ├── plan-tool.ts          # plan_write tool schema and description
-├── plan-state.ts         # Disk I/O: atomic read/write of .plan.json files
-├── plan-injection.ts     # System prompt text + Feishu card + plain-text rendering
-├── runtime-state.ts      # In-memory session state: idle counters, delegation, conversation tracking
+├── plan-state.ts         # Disk I/O: atomic read/write, DAG validation
+├── plan-injection.ts     # Prompt injection (plan reminders, orchestration directive, follow-through rules, card rendering)
+├── runtime-state.ts      # In-memory session state: turns, idle counters, delegation, orchestration bindings, managed statuses
 ├── feishu-client.ts      # Feishu REST client (send/update cards, token cache)
 └── telegram-client.ts    # Telegram Bot API client (send/edit messages)
 ```
@@ -203,6 +226,8 @@ Plan files are stored per-agent, per-session, per-plan:
 - **Subagent poke uses private API** — `enqueueSystemEvent` is not part of the formal Plugin SDK; may break on upgrades
 - **Promise-only recovery is best-effort** — when guarded modes suppress a promise-only update, the plugin can repoke the same session once, but that path also depends on the same private runtime API
 - **ConversationId fallback** — card routing to group chats depends on `conversationId` in the `message_received` hook; falls back to requester DM if unavailable
+- **Gateway restart during orchestration** — if the gateway restarts while orchestrated subagents are running, progress tracking may be lost; items may need to be re-dispatched manually
+- **Progress card lags in orchestrated mode** — the Feishu/Telegram card only updates when `plan_write` is called; the orchestration directive in the agent's prompt reflects true status immediately
 
 ## Requirements
 
