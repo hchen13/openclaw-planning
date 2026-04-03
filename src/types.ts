@@ -49,11 +49,11 @@ export interface PlanFile {
 export interface PlanWriteInput {
   title: string;
   items: Array<{
-    id: string;
+    id?: string;
     content: string;
     status: PlanStatus;
     activeForm?: string;
-    blockedBy?: string[];
+    blockedBy?: (string | number)[];
     agentTask?: string;
   }>;
   message?: string;

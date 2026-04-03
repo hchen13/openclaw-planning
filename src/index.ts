@@ -408,21 +408,64 @@ const plugin = {
               return { content: [{ type: "text" as const, text: `Plan "${input.title}" cleared.` }], details: undefined };
             }
 
-            // Validate unique item IDs
+            // ── Auto-assign item IDs ──────────────────────────────────────
+            // Items without an ID get one auto-generated. Existing items (updates)
+            // keep their ID from the previous version, matched by content.
+            {
+              // Collect IDs already provided by the agent
+              const usedIds = new Set(input.items.filter((i) => i.id).map((i) => i.id!));
+              let autoCounter = 1;
+              const generateId = () => {
+                while (usedIds.has(`t${autoCounter}`)) autoCounter++;
+                const id = `t${autoCounter}`;
+                usedIds.add(id);
+                autoCounter++;
+                return id;
+              };
+
+              for (const item of input.items) {
+                if (!item.id) {
+                  // Try to match an existing item by content (preserves ID across updates)
+                  const prev = existing?.items.find(
+                    (p) => p.content === item.content && !usedIds.has(p.id),
+                  );
+                  if (prev) {
+                    item.id = prev.id;
+                    usedIds.add(prev.id);
+                  } else {
+                    item.id = generateId();
+                  }
+                }
+              }
+
+              // Resolve index-based blockedBy references to IDs
+              for (const item of input.items) {
+                if (!item.blockedBy) continue;
+                item.blockedBy = item.blockedBy.map((ref) => {
+                  if (typeof ref === "number") {
+                    if (ref < 0 || ref >= input.items.length) return `__invalid_index_${ref}`;
+                    return input.items[ref].id!;
+                  }
+                  return ref;
+                }) as string[];
+              }
+            }
+
+            // Validate unique item IDs (after auto-assignment)
             const itemIds = new Set<string>();
             for (const item of input.items) {
-              if (itemIds.has(item.id)) {
+              if (itemIds.has(item.id!)) {
                 return {
                   content: [{ type: "text" as const, text: `Plan rejected: duplicate item ID "${item.id}". Each item must have a unique ID.` }],
                   details: undefined,
                 };
               }
-              itemIds.add(item.id);
+              itemIds.add(item.id!);
             }
 
             // Validate dependency graph if any item declares blockedBy
             if (input.items.some((i) => i.blockedBy && i.blockedBy.length > 0)) {
-              const dagError = validateDependencyGraph(input.items);
+              const dagError = validateDependencyGraph(input.items as Array<{ id: string; blockedBy?: string[] }>);
               if (dagError) {
                 return {
                   content: [{ type: "text" as const, text: `Plan rejected: ${dagError}. Fix the blockedBy fields and try again.` }],

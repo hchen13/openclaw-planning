@@ -13,15 +13,24 @@ export const PlanStatusEnum = Type.Union([
 ]);
 
 export const PlanItemSchema = Type.Object({
-  id: Type.String({ description: "Unique item ID (e.g. t1, t2, t3)" }),
+  id: Type.Optional(
+    Type.String({
+      description:
+        "Item ID. Auto-assigned by the plugin if omitted (recommended). " +
+        "When provided, used as-is. Existing items keep their IDs across updates.",
+    }),
+  ),
   content: Type.String({ description: "Task description in imperative form, ≤80 chars", maxLength: 80 }),
   status: PlanStatusEnum,
   activeForm: Type.Optional(
     Type.String({ description: "Present-tense description shown when in_progress, ≤60 chars", maxLength: 60 }),
   ),
   blockedBy: Type.Optional(
-    Type.Array(Type.String(), {
-      description: "IDs of items that must complete before this one can start. Omit or leave empty for items with no dependencies.",
+    Type.Array(Type.Union([Type.String(), Type.Number()]), {
+      description:
+        "Dependencies: IDs of items that must complete before this one starts. " +
+        "Use item IDs (strings) or 0-based array indices (numbers) to reference items in the same plan_write call. " +
+        "Indices are resolved to IDs after auto-assignment.",
     }),
   ),
   agentTask: Type.Optional(
@@ -72,7 +81,9 @@ Writing good items:
 Best practices:
 - Create a plan at the START of complex work, before doing anything else
 - Update status as you complete each step (mark in_progress → completed)
-- Only one item should be in_progress at a time
+- Only one item should be in_progress at a time (unless using orchestrated execution with parallel subagents)
+- Item IDs are auto-assigned — you can omit the \`id\` field. On updates, items are matched by content to preserve their IDs. You can also provide explicit IDs if you prefer.
+- For \`blockedBy\`, use either item IDs (strings) or 0-based array indices (numbers) to reference other items in the same call. Indices are resolved to IDs automatically.
 - Pass the COMPLETE items array every time (full replacement, not incremental)
 - If you change item content or add/remove items (not just status), explain why in the \`message\` field
 - When ALL items are done, call plan_write one final time with all items marked completed to close the plan — then send your normal reply with the actual results
@@ -89,10 +100,10 @@ Clearing a plan:
 
 Orchestrated execution (subagent-per-item):
 - For items that should be executed by subagents, provide an \`agentTask\` field with a self-contained prompt. The subagent has no conversation history — include ALL necessary context: file paths, expected formats, success criteria.
-- Declare dependencies with \`blockedBy\`: ["t1", "t2"] means this item waits until t1 and t2 are both completed.
+- Declare dependencies with \`blockedBy\` — use 0-based array indices (e.g. \`blockedBy: [0, 1]\` means "wait for the 1st and 2nd items") or item IDs if you provided them explicitly.
 - Items without \`agentTask\` are executed by you directly.
 - Each agentTask should be completable in under 2 minutes by a focused subagent. If a step would take longer, split it into smaller items.
 - Write agentTask like a briefing for a colleague who just joined: goal, context, specific actions, success criteria.
-- After creating the plan, dispatch subagents for all unblocked items. Use sessions_spawn with label set to the item ID (e.g. label: "t1") so the system can track which subagent handles which item.
+- After creating the plan, dispatch subagents for all unblocked items. Use sessions_spawn with \`label\` set to the item ID (shown in the orchestration_directive) so the system can track which subagent handles which item.
 - Spawn multiple unblocked items in a single turn for parallel execution.
 - When a subagent completes, the item is automatically marked completed and you will be prompted to dispatch newly unblocked items.`;
