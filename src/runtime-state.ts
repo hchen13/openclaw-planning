@@ -270,3 +270,62 @@ export function setPlanDelegation(childSessionKey: string, delegation: PlanDeleg
 export function getPlanDelegation(childSessionKey: string): PlanDelegation | undefined {
   return planDelegations.get(childSessionKey);
 }
+
+// ── Orchestrated execution state ──
+// Tracks the mapping between subagent child sessions and plan items,
+// plus plugin-managed item statuses that override agent-provided statuses.
+
+/** Maps childSessionKey → { parentSessionKey, planTitle, itemId } */
+interface OrchestratedItemBinding {
+  parentSessionKey: string;
+  planTitle: string;
+  itemId: string;
+}
+
+const orchestratedBindings = new Map<string, OrchestratedItemBinding>();
+
+export function setOrchestratedBinding(childSessionKey: string, binding: OrchestratedItemBinding): void {
+  orchestratedBindings.set(childSessionKey, binding);
+}
+
+export function getOrchestratedBinding(childSessionKey: string): OrchestratedItemBinding | undefined {
+  return orchestratedBindings.get(childSessionKey);
+}
+
+/**
+ * Plugin-managed item statuses. When the plugin auto-updates an item
+ * (e.g. on subagent completion), the status is recorded here.
+ * plan_write handler merges these, preventing agent-provided statuses
+ * from overwriting plugin-managed ones.
+ *
+ * Key: `${parentSessionKey}:${planTitle}:${itemId}`
+ */
+const managedStatuses = new Map<string, import("./types.js").PlanStatus>();
+
+function managedStatusKey(sessionKey: string, planTitle: string, itemId: string): string {
+  return `${sessionKey}:${planTitle}:${itemId}`;
+}
+
+export function setManagedStatus(
+  sessionKey: string,
+  planTitle: string,
+  itemId: string,
+  status: import("./types.js").PlanStatus,
+): void {
+  managedStatuses.set(managedStatusKey(sessionKey, planTitle, itemId), status);
+}
+
+export function getManagedStatus(
+  sessionKey: string,
+  planTitle: string,
+  itemId: string,
+): import("./types.js").PlanStatus | undefined {
+  return managedStatuses.get(managedStatusKey(sessionKey, planTitle, itemId));
+}
+
+export function clearManagedStatuses(sessionKey: string, planTitle: string): void {
+  const prefix = `${sessionKey}:${planTitle}:`;
+  for (const key of managedStatuses.keys()) {
+    if (key.startsWith(prefix)) managedStatuses.delete(key);
+  }
+}

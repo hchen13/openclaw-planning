@@ -9,6 +9,12 @@ export interface PlanItem {
   content: string;
   status: PlanStatus;
   activeForm?: string;
+  /** IDs of items that must complete before this one can start. */
+  blockedBy?: string[];
+  /** Self-contained prompt for the subagent executing this item. */
+  agentTask?: string;
+  /** Runtime-only: child session key assigned by the plugin during orchestrated dispatch. */
+  assignedChildSession?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -47,6 +53,8 @@ export interface PlanWriteInput {
     content: string;
     status: PlanStatus;
     activeForm?: string;
+    blockedBy?: string[];
+    agentTask?: string;
   }>;
   message?: string;
 }

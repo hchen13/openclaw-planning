@@ -157,6 +157,117 @@ export function isPlanActive(plan: PlanFile): boolean {
   return plan.items.some((i) => i.status === "pending" || i.status === "in_progress");
 }
 
+/**
+ * Check if a plan has any orchestrated items (items with agentTask).
+ */
+export function hasOrchestratedItems(plan: PlanFile): boolean {
+  return plan.items.some((i) => i.agentTask);
+}
+
+/**
+ * Build <orchestration_directive> for injection when plans have orchestrated items
+ * that are ready for dispatch or awaiting results.
+ *
+ * Returns null if no orchestrated items need attention.
+ */
+export function buildOrchestrationDirective(plans: PlanFile[]): string | null {
+  const readyItems: Array<{ planTitle: string; id: string; content: string }> = [];
+  const blockedItems: Array<{ planTitle: string; id: string; content: string; waitingOn: string[] }> = [];
+  const deadlockedItems: Array<{ planTitle: string; id: string; content: string; failedDeps: string[] }> = [];
+  const runningItems: Array<{ planTitle: string; id: string; content: string }> = [];
+  const completedItems: Array<{ planTitle: string; id: string; content: string }> = [];
+
+  for (const plan of plans) {
+    if (!hasOrchestratedItems(plan)) continue;
+
+    const completedIds = new Set(
+      plan.items.filter((i) => i.status === "completed").map((i) => i.id),
+    );
+    const terminalFailedIds = new Set(
+      plan.items.filter((i) => i.status === "failed" || i.status === "cancelled").map((i) => i.id),
+    );
+
+    for (const item of plan.items) {
+      if (!item.agentTask) continue; // Not orchestrated
+
+      if (item.status === "completed" || item.status === "cancelled" || item.status === "failed") {
+        completedItems.push({ planTitle: plan.title, id: item.id, content: item.content });
+        continue;
+      }
+
+      if (item.status === "in_progress") {
+        runningItems.push({ planTitle: plan.title, id: item.id, content: item.content });
+        continue;
+      }
+
+      // pending — check if all blockers are resolved
+      const unresolvedBlockers = (item.blockedBy ?? []).filter((dep) => !completedIds.has(dep));
+      if (unresolvedBlockers.length === 0) {
+        readyItems.push({ planTitle: plan.title, id: item.id, content: item.content });
+      } else {
+        // Check if any unresolved blocker is in a terminal failed state (deadlock)
+        const failedDeps = unresolvedBlockers.filter((dep) => terminalFailedIds.has(dep));
+        if (failedDeps.length > 0) {
+          deadlockedItems.push({ planTitle: plan.title, id: item.id, content: item.content, failedDeps });
+        } else {
+          blockedItems.push({ planTitle: plan.title, id: item.id, content: item.content, waitingOn: unresolvedBlockers });
+        }
+      }
+    }
+  }
+
+  // Nothing to orchestrate
+  if (readyItems.length === 0 && runningItems.length === 0 && blockedItems.length === 0 && deadlockedItems.length === 0) return null;
+
+  const lines: string[] = [];
+
+  if (readyItems.length > 0) {
+    lines.push("Ready to dispatch (no blockers — spawn subagents now):");
+    for (const item of readyItems) {
+      lines.push(`  → ${item.id}: "${item.content}" — use sessions_spawn with label="${item.id}"`);
+    }
+    if (readyItems.length > 1) {
+      lines.push(`Spawn all ${readyItems.length} ready items in a single turn for parallel execution.`);
+    }
+  }
+
+  if (runningItems.length > 0) {
+    lines.push("Running (subagent in progress):");
+    for (const item of runningItems) {
+      lines.push(`  ◉ ${item.id}: "${item.content}"`);
+    }
+  }
+
+  if (blockedItems.length > 0) {
+    lines.push("Blocked (waiting for dependencies):");
+    for (const item of blockedItems) {
+      lines.push(`  ○ ${item.id}: "${item.content}" — waiting on ${item.waitingOn.join(", ")}`);
+    }
+  }
+
+  if (deadlockedItems.length > 0) {
+    lines.push("⚠️ Deadlocked (dependency failed/cancelled — cannot proceed automatically):");
+    for (const item of deadlockedItems) {
+      lines.push(`  ✗ ${item.id}: "${item.content}" — blocked by failed: ${item.failedDeps.join(", ")}`);
+    }
+    lines.push("Decide for each: retry the failed dependency (set it to pending in plan_write), skip this item (mark cancelled), or abort the plan.");
+  }
+
+  if (completedItems.length > 0) {
+    lines.push("Completed:");
+    for (const item of completedItems) {
+      lines.push(`  ● ${item.id}: "${item.content}"`);
+    }
+  }
+
+  // Remind agent to sync plan status to disk (updates the progress card)
+  if (readyItems.length > 0 || completedItems.length > 0) {
+    lines.push("After dispatching, call plan_write to sync item statuses — this updates the user's progress card.");
+  }
+
+  return `<orchestration_directive>\n${lines.join("\n")}\n</orchestration_directive>`;
+}
+
 // ─── Feishu Card Rendering (Card DSL format) ─────────────────────────────────
 
 // Bloomberg palette: #F5821F orange for active, grey for done, white for pending

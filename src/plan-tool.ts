@@ -19,6 +19,19 @@ export const PlanItemSchema = Type.Object({
   activeForm: Type.Optional(
     Type.String({ description: "Present-tense description shown when in_progress, ≤60 chars", maxLength: 60 }),
   ),
+  blockedBy: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "IDs of items that must complete before this one can start. Omit or leave empty for items with no dependencies.",
+    }),
+  ),
+  agentTask: Type.Optional(
+    Type.String({
+      description:
+        "Self-contained prompt for a subagent to execute this item. Include ALL context the subagent needs — it cannot see conversation history. " +
+        "When provided, the plugin enters orchestrated execution: it tracks subagent↔item mapping, auto-updates item status on completion, and prompts you to dispatch newly unblocked items. " +
+        "Each agentTask should be completable in under 2 minutes by a focused subagent.",
+    }),
+  ),
 });
 
 export const PlanWriteSchema = Type.Object({
@@ -37,7 +50,7 @@ export const PLAN_WRITE_DESCRIPTION = `Write or update the current task plan. Cr
 When to use:
 - Any multi-step task, including purely linear flows (read → analyze → output) — a plan keeps you on track through compaction and gives the user real-time visibility. Don't skip it because a task feels simple.
 - Tasks with ≥3 distinct phases or branching decisions
-- ALWAYS before spawning sub-agents (sessions_spawn will be BLOCKED if no plan exists). Write the full plan first — break the task into items covering all phases, then spawn. The sub-agent will see and update your plan automatically
+- ALWAYS before spawning sub-agents (sessions_spawn will be BLOCKED if no plan exists). Write the full plan first — break the task into items covering all phases, then spawn. For non-orchestrated spawns, the sub-agent will see and update your plan automatically via delegation. For orchestrated items (with agentTask), the plugin manages status updates — the sub-agent focuses solely on its task
 
 When NOT to use:
 - Tasks completable in 1-3 tool calls
@@ -72,4 +85,14 @@ Multiple concurrent plans:
 - The system prompt will show all active plans; update each by passing its exact title
 
 Clearing a plan:
-- Pass an empty items array with the plan's title to clear that specific plan`;
+- Pass an empty items array with the plan's title to clear that specific plan
+
+Orchestrated execution (subagent-per-item):
+- For items that should be executed by subagents, provide an \`agentTask\` field with a self-contained prompt. The subagent has no conversation history — include ALL necessary context: file paths, expected formats, success criteria.
+- Declare dependencies with \`blockedBy\`: ["t1", "t2"] means this item waits until t1 and t2 are both completed.
+- Items without \`agentTask\` are executed by you directly.
+- Each agentTask should be completable in under 2 minutes by a focused subagent. If a step would take longer, split it into smaller items.
+- Write agentTask like a briefing for a colleague who just joined: goal, context, specific actions, success criteria.
+- After creating the plan, dispatch subagents for all unblocked items. Use sessions_spawn with label set to the item ID (e.g. label: "t1") so the system can track which subagent handles which item.
+- Spawn multiple unblocked items in a single turn for parallel execution.
+- When a subagent completes, the item is automatically marked completed and you will be prompted to dispatch newly unblocked items.`;

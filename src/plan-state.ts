@@ -141,9 +141,57 @@ export function buildPlan(
       const changed = !prev || prev.status !== item.status || prev.content !== item.content || prev.activeForm !== item.activeForm;
       return {
         ...item,
+        // Preserve runtime-only field written by the plugin (not agent-provided)
+        assignedChildSession: prev?.assignedChildSession,
         createdAt: prev?.createdAt ?? now,
         updatedAt: changed ? now : (prev?.updatedAt ?? now),
       };
     }),
   };
+}
+
+/**
+ * Validate the dependency graph declared by blockedBy fields.
+ * Returns null if valid, or an error message string.
+ */
+export function validateDependencyGraph(
+  items: Array<{ id: string; blockedBy?: string[] }>,
+): string | null {
+  const ids = new Set(items.map((i) => i.id));
+
+  // Check for references to non-existent items
+  for (const item of items) {
+    for (const dep of item.blockedBy ?? []) {
+      if (!ids.has(dep)) return `Item "${item.id}" depends on unknown item "${dep}"`;
+      if (dep === item.id) return `Item "${item.id}" depends on itself`;
+    }
+  }
+
+  // Detect cycles via topological sort (Kahn's algorithm)
+  const inDegree = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+  for (const item of items) {
+    inDegree.set(item.id, 0);
+    adj.set(item.id, []);
+  }
+  for (const item of items) {
+    for (const dep of item.blockedBy ?? []) {
+      adj.get(dep)!.push(item.id);
+      inDegree.set(item.id, (inDegree.get(item.id) ?? 0) + 1);
+    }
+  }
+  const queue = [...inDegree.entries()].filter(([, d]) => d === 0).map(([id]) => id);
+  let visited = 0;
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    visited++;
+    for (const neighbor of adj.get(node) ?? []) {
+      const d = (inDegree.get(neighbor) ?? 1) - 1;
+      inDegree.set(neighbor, d);
+      if (d === 0) queue.push(neighbor);
+    }
+  }
+  if (visited < items.length) return "Circular dependency detected in plan items";
+
+  return null;
 }

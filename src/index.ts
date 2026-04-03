@@ -3,11 +3,14 @@
  *
  * Registered capabilities:
  *   Tool:   plan_write          — create/update structured task plans
- *   Hook:   before_prompt_build — inject plan reminder (sparse / full / stale)
+ *   Hook:   before_prompt_build — inject plan reminder + orchestration directive + follow-through rules
+ *   Hook:   before_tool_call    — spawn gating (no plan → no spawn) + dependency check
  *   Hook:   after_tool_call     — maintain per-session idle counter
- *   Hook:   subagent_ended      — poke parent session when announce may be skipped
+ *   Hook:   subagent_spawned    — orchestrated binding or plan delegation
+ *   Hook:   subagent_ended      — orchestrated status auto-update + fallback poke
  *   Hook:   message_received    — capture conversationId for card routing
- *   Hook:   message_sending     — intercept pointless confirmation requests
+ *   Hook:   message_sending     — confirmation suppression + promise-only turn guard
+ *   Hook:   agent_end           — promise guard recovery repoke
  */
 
 import * as path from "path";
@@ -23,12 +26,15 @@ import {
   readAllPlansFromDir,
   writePlan,
   buildPlan,
+  validateDependencyGraph,
 } from "./plan-state.js";
 import {
   buildPlanReminder,
   buildPlanReminderSparse,
   buildPlanAvailable,
   buildDelegatedPlanReminder,
+  buildOrchestrationDirective,
+  hasOrchestratedItems,
   isPlanActive,
   renderFeishuCard,
   renderPlainText,
@@ -64,6 +70,11 @@ import {
   getAccountConversationId,
   setPlanDelegation,
   getPlanDelegation,
+  setOrchestratedBinding,
+  getOrchestratedBinding,
+  setManagedStatus,
+  getManagedStatus,
+  clearManagedStatuses,
   type TurnState,
 } from "./runtime-state.js";
 import type { PlanWriteInput } from "./types.js";
@@ -381,6 +392,10 @@ const plugin = {
                   try { await unlink(legacyPath); } catch (err: any) { if (err.code !== "ENOENT") throw err; }
                 }
               }
+              // Clean up managed statuses for the cleared plan
+              const clearKey = delegation?.parentSessionKey ?? sessionKey;
+              if (clearKey) clearManagedStatuses(clearKey, input.title);
+
               // Sync runtime state so message_sending hook doesn't think a plan is still active
               const remainingPlans = delegation
                 ? await readAllPlansFromDir(effectivePlanDir)
@@ -391,6 +406,50 @@ const plugin = {
 
               logger.info?.(`planning: plan "${input.title}" cleared for session ${sessionId.slice(0, 8)}`);
               return { content: [{ type: "text" as const, text: `Plan "${input.title}" cleared.` }], details: undefined };
+            }
+
+            // Validate unique item IDs
+            const itemIds = new Set<string>();
+            for (const item of input.items) {
+              if (itemIds.has(item.id)) {
+                return {
+                  content: [{ type: "text" as const, text: `Plan rejected: duplicate item ID "${item.id}". Each item must have a unique ID.` }],
+                  details: undefined,
+                };
+              }
+              itemIds.add(item.id);
+            }
+
+            // Validate dependency graph if any item declares blockedBy
+            if (input.items.some((i) => i.blockedBy && i.blockedBy.length > 0)) {
+              const dagError = validateDependencyGraph(input.items);
+              if (dagError) {
+                return {
+                  content: [{ type: "text" as const, text: `Plan rejected: ${dagError}. Fix the blockedBy fields and try again.` }],
+                  details: undefined,
+                };
+              }
+            }
+
+            // Apply plugin-managed statuses: if the plugin has auto-updated an item
+            // (e.g. subagent completed), preserve that status regardless of what the agent passes.
+            // Exception: if the agent explicitly sets "pending", treat it as a retry intent and
+            // clear the managed status so the item can be re-dispatched.
+            const parentSessionKey = delegation?.parentSessionKey ?? sessionKey;
+            if (parentSessionKey) {
+              for (const item of input.items) {
+                const managed = getManagedStatus(parentSessionKey, input.title, item.id);
+                if (managed && managed !== item.status) {
+                  if (item.status === "pending") {
+                    // Agent wants to retry — clear managed status
+                    setManagedStatus(parentSessionKey, input.title, item.id, "pending");
+                    logger.info?.(`planning: cleared managed status for item "${item.id}" (agent retry)`);
+                  } else {
+                    logger.info?.(`planning: enforcing managed status for item "${item.id}": ${item.status} → ${managed}`);
+                    item.status = managed;
+                  }
+                }
+              }
             }
 
             // Build and write plan
@@ -574,25 +633,47 @@ const plugin = {
         if (agentId) setAgentActivePlan(agentId, true);
         if (sessionKey) setSessionActivePlan(sessionKey, true);
 
+        // Apply managedStatuses BEFORE building any prompt content.
+        // managedStatus lives in runtime state (set by subagent_ended) and may not be
+        // written to disk yet. We apply it so both the plan reminder and the orchestration
+        // directive reflect the true state.
+        const effectiveParentKey = delegation?.parentSessionKey ?? sessionKey;
+        if (effectiveParentKey) {
+          for (const plan of activePlans) {
+            for (const item of plan.items) {
+              const managed = getManagedStatus(effectiveParentKey, plan.title, item.id);
+              if (managed) item.status = managed;
+            }
+          }
+        }
+
         const idleCount = sessionKey ? getIdleCount(sessionKey) : SPARSE_THRESHOLD;
-        const stale = idleCount >= STALE_THRESHOLD;
+        // Suppress stale warning when orchestrated items are actively running —
+        // the agent may not call plan_write frequently since the plugin auto-manages statuses.
+        const hasActiveOrchestration = activePlans.some(
+          (p) => hasOrchestratedItems(p) && p.items.some((i) => i.agentTask && i.status === "in_progress"),
+        );
+        const stale = !hasActiveOrchestration && idleCount >= STALE_THRESHOLD;
 
         let reminder: string;
         if (delegation) {
-          // Delegated subagent — show parent's plans with delegation instructions
           reminder = buildDelegatedPlanReminder(activePlans, stale);
           if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_delegated", true);
         } else if (idleCount < SPARSE_THRESHOLD) {
-          // Just updated — short reminder to save tokens
           reminder = buildPlanReminderSparse(activePlans);
           if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_sparse", true);
         } else {
-          // Normal or stale — full reminder
           reminder = buildPlanReminder(activePlans, stale);
           if (sessionKey) setTurnPromptState(sessionKey, "plan_reminder_full", true);
         }
 
-        return { prependContext: reminder, appendSystemContext: FOLLOW_THROUGH_RULES };
+        // Append orchestration directive for plans with agentTask items
+        const orchDirective = activePlans.some(hasOrchestratedItems)
+          ? buildOrchestrationDirective(activePlans)
+          : null;
+        const fullContext = orchDirective ? `${reminder}\n\n${orchDirective}` : reminder;
+
+        return { prependContext: fullContext, appendSystemContext: FOLLOW_THROUGH_RULES };
       }
 
       // No active plan
@@ -643,18 +724,50 @@ const plugin = {
     });
 
     // ── subagent_ended Hook ──────────────────────────────────────────────────
-    // Only fires a fallback poke for non-ok outcomes (error / timeout / killed).
-    // Normal successful subagent completions are handled by the announce mechanism.
+    // Two responsibilities:
+    // 1. Orchestrated items: auto-update item status in managedStatus
+    // 2. Fallback poke for non-ok outcomes (error / timeout / killed)
     api.on("subagent_ended", async (event: any, ctx: any) => {
       const parentKey: string | undefined = ctx?.requesterSessionKey;
       if (!parentKey) return;
 
       const outcome: string = event?.outcome ?? "ok";
+      const subagentKey: string = event?.targetSessionKey ?? ctx?.childSessionKey ?? "unknown";
+      const errorDetail: string = event?.error ?? "";
+
+      // ── Orchestrated item auto-update ──────────────────────────────────
+      const binding = getOrchestratedBinding(subagentKey);
+      if (binding) {
+        const newStatus = outcome === "ok" ? "completed" as const : "failed" as const;
+        setManagedStatus(binding.parentSessionKey, binding.planTitle, binding.itemId, newStatus);
+        logger.info?.(
+          `planning: orchestrated item "${binding.itemId}" in "${binding.planTitle}" → ${newStatus} ` +
+          `(subagent ${subagentKey.slice(-8)}, outcome=${outcome})`
+        );
+
+        // For failed items, poke parent with error details so it can decide what to do
+        if (outcome !== "ok") {
+          const enqueue = (api as any).runtime?.system?.enqueueSystemEvent?.bind(
+            (api as any).runtime?.system,
+          );
+          if (enqueue) {
+            const msg =
+              `[planning] Subagent for item "${binding.itemId}" failed (outcome=${outcome}).` +
+              (errorDetail ? ` Error: ${errorDetail}` : "") +
+              ` Decide: retry (spawn a new subagent for this item), skip (mark as failed in plan_write), or abort.`;
+            enqueue(msg, { sessionKey: parentKey });
+          }
+        }
+        // Success case: announce mechanism will trigger a new main agent turn,
+        // and before_prompt_build will inject orchestration directive with newly unblocked items.
+        return;
+      }
+
+      // ── Non-orchestrated fallback poke (existing behavior) ─────────────
       if (outcome === "ok") return; // Announce will handle it
 
-      const subagentKey: string = event?.targetSessionKey ?? ctx?.childSessionKey ?? "unknown";
       const planDir = getPlanDir(parentKey);
-      if (!planDir) return; // Parent session not seen yet, skip
+      if (!planDir) return;
 
       setTimeout(async () => {
         try {
@@ -681,8 +794,9 @@ const plugin = {
     });
 
     // ── subagent_spawned Hook ────────────────────────────────────────────────
-    // Establishes plan delegation: subagent writes to parent's plan files so the
-    // user sees real-time progress on the parent's Feishu/Telegram card.
+    // Two paths:
+    // 1. Orchestrated: label matches a plan item ID → bind child↔item, skip delegation
+    // 2. Non-orchestrated (existing): establish plan delegation for manual subagent plan updates
     api.on("subagent_spawned", async (event: any, ctx: any) => {
       const childSessionKey: string | undefined = event?.childSessionKey;
       const parentSessionKey: string | undefined = ctx?.requesterSessionKey;
@@ -691,11 +805,52 @@ const plugin = {
       const parentPlanDir = getPlanDir(parentSessionKey);
       if (!parentPlanDir) return; // Parent session not tracked yet
 
-      // Only delegate if parent has active plans
       const parentPlans = await readAllPlansFromDir(parentPlanDir);
       if (!parentPlans.some((p) => isPlanActive(p))) return;
 
-      // Propagate channel context from parent so subagent's plan_write can send cards
+      // ── Check for orchestrated dispatch (label matches an item ID with agentTask) ──
+      const label: string | undefined = event?.label;
+      if (label) {
+        for (const plan of parentPlans) {
+          // Apply managedStatus to get true item status before matching
+          const effectiveStatus = (item: typeof plan.items[0]) =>
+            getManagedStatus(parentSessionKey, plan.title, item.id) ?? item.status;
+          const matchedItem = plan.items.find(
+            (item) => item.id === label && item.agentTask,
+          );
+          if (matchedItem) {
+            // Guard: skip if item is already in_progress or terminal (prevents duplicate dispatch)
+            const currentStatus = effectiveStatus(matchedItem);
+            if (currentStatus !== "pending") {
+              logger.warn?.(
+                `planning: rejected duplicate dispatch for item "${matchedItem.id}" — already ${currentStatus}`
+              );
+              // Do NOT fall through to delegation — this subagent should not get plan access
+              return;
+            }
+            // Record binding: this child session handles this specific item
+            setOrchestratedBinding(childSessionKey, {
+              parentSessionKey,
+              planTitle: plan.title,
+              itemId: matchedItem.id,
+            });
+            // Auto-mark item as in_progress
+            setManagedStatus(parentSessionKey, plan.title, matchedItem.id, "in_progress");
+            logger.info?.(
+              `planning: orchestrated bind ${childSessionKey.slice(-8)} → ` +
+              `item "${matchedItem.id}" in "${plan.title}" (parent ${parentSessionKey.slice(-8)})`
+            );
+            // Skip delegation — orchestrated subagents don't write to parent plan files
+            return;
+          }
+        }
+        // Label was provided but didn't match any orchestrated item
+        logger.info?.(
+          `planning: spawn label "${label}" did not match any orchestrated item — falling through to delegation`
+        );
+      }
+
+      // ── Non-orchestrated: establish plan delegation (existing behavior) ──
       const parentConvId =
         getSessionConversationId(parentSessionKey) ??
         (event?.requester?.accountId ? getAccountConversationId(event.requester.accountId) : undefined);
