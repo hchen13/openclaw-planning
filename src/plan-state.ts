@@ -141,6 +141,8 @@ export function buildPlan(
       const changed = !prev || prev.status !== item.status || prev.content !== item.content || prev.activeForm !== item.activeForm;
       return {
         ...item,
+        id: item.id as string, // guaranteed by auto-assign in index.ts before buildPlan is called
+        blockedBy: item.blockedBy as string[] | undefined, // indices resolved to strings in index.ts
         createdAt: prev?.createdAt ?? now,
         updatedAt: changed ? now : (prev?.updatedAt ?? now),
       };

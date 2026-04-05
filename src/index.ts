@@ -76,9 +76,33 @@ import {
   getManagedStatus,
   deleteManagedStatus,
   clearManagedStatuses,
+  getOrchestratedBindingsForParent,
+  deleteOrchestratedBinding,
+  deletePlanDelegation,
+  pushActivatedItem,
+  popActivatedItem,
+  isPlanTitleConfirmed,
+  markPlanTitleConfirmed,
+  getPlanAbandonmentRepokes,
+  getPlanCloseNudges,
+  incrementPlanCloseNudges,
+  resetPlanCloseNudges,
+  incrementPlanAbandonmentRepokes,
+  resetPlanAbandonmentRepokes,
   type TurnState,
 } from "./runtime-state.js";
 import type { PlanWriteInput } from "./types.js";
+import {
+  startMetricsTracking,
+  recordToolStart,
+  recordToolEnd,
+  clearMetrics,
+  buildLiveMetricsMap,
+  initCardRefresh,
+  registerCardRefreshTarget,
+  unregisterCardRefreshTarget,
+  hasActiveMetricsForPlan,
+} from "./live-metrics.js";
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
 /** Below this idle count → sparse reminder (model just updated the plan). */
@@ -87,11 +111,15 @@ const SPARSE_THRESHOLD = 3;
 const STALE_THRESHOLD = 8;
 /** Delay before poking parent session after a non-ok subagent exit (ms). */
 const SUBAGENT_POKE_DELAY_MS = 5_000;
+/** Max consecutive plan-abandonment repokes before giving up. */
+const PLAN_ABANDONMENT_MAX_REPOKES = 3;
+/** Max nudges for completed-but-not-closed plans. */
+const PLAN_CLOSE_MAX_NUDGES = 2;
 /** Max content length to consider as a standalone confirmation message. */
 const CONFIRMATION_MAX_LEN = 200;
 /** Rollout mode for promise-only turn guard. */
 type PromiseGuardMode = "off" | "observe" | "enforce_active_plan" | "enforce_task_turn";
-const PROMISE_GUARD_MODE: PromiseGuardMode = "enforce_active_plan";
+const PROMISE_GUARD_MODE = "enforce_active_plan" as PromiseGuardMode;
 const PROMISE_GUARD_MAX_LEN = 240;
 const PROMISE_GUARD_MAX_CONSECUTIVE_REPOKES = 1;
 const PROMISE_GUARD_RECOVERY_PROMPT = `[planning] Your previous user-visible message was suppressed because it stated intent without action.
@@ -342,6 +370,19 @@ const plugin = {
     const logger = api.logger;
     logger.info?.("planning: registering plugin");
 
+    // ── Initialize live-metrics card refresh ────────────────────────────────
+    initCardRefresh({
+      readPlan,
+      renderCard: renderFeishuCard,
+      applyManagedStatuses: (parentSessionKey, plan) => {
+        for (const item of plan.items) {
+          const managed = getManagedStatus(parentSessionKey, plan.title, item.id);
+          if (managed) item.status = managed;
+        }
+      },
+      logger,
+    });
+
     // ── plan_write Tool ──────────────────────────────────────────────────────
     api.registerTool(
       (ctx) => {
@@ -484,17 +525,24 @@ const plugin = {
 
             // Apply plugin-managed statuses: if the plugin has auto-updated an item
             // (e.g. subagent completed), preserve that status regardless of what the agent passes.
-            // Exception: if the agent explicitly sets "pending", treat it as a retry intent and
-            // clear the managed status so the item can be re-dispatched.
+            // Exceptions:
+            // - Agent sets "pending" → retry intent, clear managed status
+            // - Agent sets a terminal status (completed/failed/cancelled) while managed is "in_progress"
+            //   → forward progress, accept and clear managed status (handles gateway restart losing bindings)
             const parentSessionKey = delegation?.parentSessionKey ?? sessionKey;
+            const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
             if (parentSessionKey) {
               for (const item of input.items) {
-                const managed = getManagedStatus(parentSessionKey, input.title, item.id);
+                const managed = getManagedStatus(parentSessionKey, input.title, item.id!);
                 if (managed && managed !== item.status) {
                   if (item.status === "pending") {
                     // Agent wants to retry — delete managed status so it no longer overrides
                     deleteManagedStatus(parentSessionKey, input.title, item.id!);
                     logger.info?.(`planning: cleared managed status for item "${item.id}" (agent retry)`);
+                  } else if (TERMINAL_STATUSES.has(item.status) && managed === "in_progress") {
+                    // Agent is marking forward progress — accept and clear stale managed status
+                    deleteManagedStatus(parentSessionKey, input.title, item.id!);
+                    logger.info?.(`planning: accepted forward progress for item "${item.id}": ${managed} → ${item.status} (managed status cleared)`);
                   } else {
                     logger.info?.(`planning: enforcing managed status for item "${item.id}": ${item.status} → ${managed}`);
                     item.status = managed;
@@ -508,6 +556,20 @@ const plugin = {
             const effectiveSessionId = (delegation && existing?.sessionId)
               ? existing.sessionId
               : sessionId;
+            // Detect items transitioning to in_progress (for auto-binding spawns)
+            // Must happen BEFORE buildPlan since input.items has the final statuses
+            const activatingSessionKey = delegation?.parentSessionKey ?? sessionKey;
+            if (activatingSessionKey) {
+              for (const item of input.items) {
+                if (item.status !== "in_progress") continue;
+                const prevStatus = existing?.items.find((i) => i.id === item.id)?.status;
+                // Only push if transitioning from non-in_progress (or new item)
+                if (!prevStatus || prevStatus !== "in_progress") {
+                  pushActivatedItem(activatingSessionKey, input.title, item.id!);
+                }
+              }
+            }
+
             const plan = buildPlan(input, existing, {
               sessionId: effectiveSessionId,
               agentId: agentId ?? "unknown",
@@ -540,8 +602,10 @@ const plugin = {
             // Feishu card
             const creds = resolveFeishuCreds(ctx.config, effectiveAccountId);
 
-            if (channel === "feishu" && creds && notifyTarget) {
-              const cardJson = renderFeishuCard(plan, input.message);
+            if (channel === "feishu" && creds && notifyTarget && parentSessionKey) {
+              // Include live metrics in card render so plan_write never wipes them
+              const metricsMap = buildLiveMetricsMap(parentSessionKey, input.title);
+              const cardJson = renderFeishuCard(plan, input.message, metricsMap);
               const feishuSameSession = plan.feishu?.sessionId === effectiveSessionId;
               if (plan.feishu?.messageId && feishuSameSession) {
                 try {
@@ -549,6 +613,13 @@ const plugin = {
                   await patchPlanChannelState(planPath, {
                     feishu: { messageId: plan.feishu.messageId, targetId: plan.feishu.targetId, sessionId: plan.feishu.sessionId ?? sessionId, lastUpdatedAt: Date.now() },
                   });
+                  // Register for live-metrics periodic refresh if orchestrated items are active
+                  if (plan.items.some((i) => i.status === "in_progress")) {
+                    registerCardRefreshTarget({
+                      planPath, planTitle: plan.title, parentSessionKey,
+                      creds, messageId: plan.feishu.messageId,
+                    });
+                  }
                 } catch (err) {
                   logger.warn?.(`planning: PATCH failed, sending new card: ${err}`);
                   try {
@@ -556,6 +627,12 @@ const plugin = {
                     await patchPlanChannelState(planPath, {
                       feishu: { messageId: result.messageId, targetId: notifyTarget, lastUpdatedAt: Date.now(), sessionId: effectiveSessionId },
                     });
+                    if (plan.items.some((i) => i.status === "in_progress")) {
+                      registerCardRefreshTarget({
+                        planPath, planTitle: plan.title, parentSessionKey,
+                        creds, messageId: result.messageId,
+                      });
+                    }
                   } catch (sendErr) {
                     logger.warn?.(`planning: send card also failed: ${sendErr}`);
                   }
@@ -566,6 +643,12 @@ const plugin = {
                   await patchPlanChannelState(planPath, {
                     feishu: { messageId: result.messageId, targetId: notifyTarget, lastUpdatedAt: Date.now(), sessionId: effectiveSessionId },
                   });
+                  if (plan.items.some((i) => i.status === "in_progress")) {
+                    registerCardRefreshTarget({
+                      planPath, planTitle: plan.title, parentSessionKey,
+                      creds, messageId: result.messageId,
+                    });
+                  }
                 } catch (err) {
                   logger.warn?.(`planning: send card failed: ${err}`);
                 }
@@ -735,15 +818,135 @@ const plugin = {
     });
 
     // ── before_tool_call Hook ────────────────────────────────────────────────
-    // Block sessions_spawn when the parent has no active plan. Forces the agent
-    // to create a plan first, ensuring the plugin can inject plan context,
-    // enable delegation, and allow the user to cancel/track via the card.
+    // 1. Block sessions_spawn when the parent has no active plan.
+    // 2. Track live metrics for orchestrated subagent tool calls.
     api.on("before_tool_call", async (event: any, ctx: any) => {
       const toolName: string = event?.toolName ?? "";
-      if (toolName !== "sessions_spawn") return;
-
       const sessionKey: string | undefined = ctx?.sessionKey;
+
+      // ── Live metrics: record tool start for orchestrated subagents ──
+      if (sessionKey && toolName) {
+        const binding = getOrchestratedBinding(sessionKey);
+        if (binding) {
+          recordToolStart(sessionKey, toolName, event?.params ?? event?.args);
+        }
+      }
+
+      // ── Block plan_write from ALL subagents (bound or delegated) ──
+      // Subagents execute tasks, they don't create or update plans.
+      // The main agent (coordinator) manages all plan state.
+      if (toolName === "plan_write" && sessionKey) {
+        if (getOrchestratedBinding(sessionKey) || getPlanDelegation(sessionKey)) {
+          logger.info?.(`planning: blocked plan_write from subagent (session ${sessionKey.slice(-8)})`);
+          return {
+            block: true,
+            blockReason:
+              "You are a sub-agent executing a specific task. Do not create or update plans — " +
+              "just do the work directly. Break your task into steps mentally and execute them sequentially.",
+          };
+        }
+      }
+
+      // ── Plan confirmation gate ──
+      // First plan_write for a NEW plan title is blocked: agent must present the
+      // plan to the user and confirm scope before creating it. This prevents
+      // plans that are off-target — especially important for weaker models (GPT).
+      // Skip for subagents (delegated or bound) — they execute, not plan.
+      if (toolName === "plan_write" && sessionKey) {
+        const hasDelegation = !!getPlanDelegation(sessionKey);
+        const hasBound = !!getOrchestratedBinding(sessionKey);
+        if (!hasDelegation && !hasBound) {
+          const params = event?.params ?? event?.args ?? {};
+          const title: string = params.title ?? "";
+          const items: unknown[] = params.items ?? [];
+          if (title && items.length > 0 && !isPlanTitleConfirmed(sessionKey, title)) {
+            // Check if a plan with this title already exists on disk (update, not new)
+            const planDir = getPlanDir(sessionKey);
+            if (planDir) {
+              const existingPath = resolvePlanFilePath(planDir, title);
+              const existing = await readPlan(existingPath);
+              if (!existing) {
+                // New plan — block and require confirmation
+                markPlanTitleConfirmed(sessionKey, title); // Allow next attempt
+                logger.info?.(`planning: plan confirmation gate — blocked new plan "${title}" (session ${sessionKey.slice(-8)})`);
+                return {
+                  block: true,
+                  blockReason:
+                    "STOP. Before creating this plan, align with the user on what they actually want. A plan written from assumptions wastes everyone's time — the goal here is to produce a plan the user will actually accept on the first try.\n\n" +
+                    "Two-phase process:\n\n" +
+                    "1. EXPLORE what's discoverable yourself (do NOT ask the user about these):\n" +
+                    "   - File structure, existing code, configs, recent commits, docs in the repo\n" +
+                    "   - Anything you can find by reading files or running read-only tools\n" +
+                    "   - If the user referenced something specific (a file, a bug, a feature), go look at it first\n\n" +
+                    "2. ASK the user about what you genuinely cannot know — things that live in their head:\n" +
+                    "   - Goal & success criteria: what does 'done' look like? What problem is this really solving?\n" +
+                    "   - Scope boundaries: what's in, what's explicitly out? How deep should this go?\n" +
+                    "   - Constraints: deadlines, tools/libraries to use or avoid, style preferences, things that must not break\n" +
+                    "   - Tradeoffs & preferences: when there are multiple reasonable approaches, which does the user prefer and why?\n" +
+                    "   - Unknowns you surfaced during exploration: ambiguities in existing code, conflicting signals, missing context\n\n" +
+                    "How to ask:\n" +
+                    "- Batch ALL your questions into ONE message. Do not drip-feed questions one at a time — that's exhausting for the user.\n" +
+                    "- Skip questions whose answers are obvious from context or already stated. Don't ask for confirmation of things the user already told you.\n" +
+                    "- For each ambiguity, either ask directly OR state your assumption clearly so the user can correct it. Prefer asking when stakes are high (irreversible work, big scope) and assuming when stakes are low.\n" +
+                    "- If the task is already crystal clear (simple, well-scoped, unambiguous), skip straight to presenting the plan — don't manufacture questions.\n\n" +
+                    "After the user responds, call plan_write again with the refined plan. It will go through. If the user has ALREADY answered your questions earlier in this conversation, call plan_write again now — this gate only fires once per plan title.",
+                };
+              }
+            }
+          }
+        }
+      }
+
+      // ── Coordinator mode: block execution tools when active plan exists ──
+      // When a plan is active, the main agent acts as coordinator — it can only
+      // plan, spawn, read, and communicate. Actual work must go through subagents.
+      // This guarantees every item has a subagent → live metrics always work.
+      const COORDINATOR_ALLOWED_TOOLS = new Set([
+        // Planning & coordination
+        "plan_write", "sessions_spawn", "sessions_yield", "sessions_send",
+        "sessions_list", "sessions_history", "session_status", "subagents",
+        // Read-only (agent needs to understand context before spawning)
+        "read", "Glob", "Grep", "Read",
+        // Communication
+        "message",
+        // Memory & admin
+        "memory_search", "memory_get", "cron", "agents_list", "gateway",
+        // Feishu read-only
+        "feishu_id", "feishu_id_admin", "feishu_group_context", "feishu_app_scopes",
+      ]);
+
+      if (sessionKey && toolName && !COORDINATOR_ALLOWED_TOOLS.has(toolName)) {
+        // Only enforce for main sessions (not subagents)
+        if (!getPlanDelegation(sessionKey) && !getOrchestratedBinding(sessionKey)) {
+          if (getSessionActivePlan(sessionKey)) {
+            logger.info?.(`planning: coordinator mode blocked "${toolName}" — session ${sessionKey.slice(-8)} has active plan`);
+            return {
+              block: true,
+              blockReason:
+                "You have an active plan. As coordinator, you must delegate execution to sub-agents. " +
+                "Set the next item to in_progress via plan_write, then use sessions_spawn to assign it. " +
+                "Do not execute work directly — your role is to plan, dispatch, and synthesize results.",
+            };
+          }
+        }
+      }
+
+      // ── Spawn gating ──
+      if (toolName !== "sessions_spawn") return;
       if (!sessionKey) return;
+
+      // Block subagent chains: subagents with delegation or orchestrated binding should not spawn further
+      const delegation = getPlanDelegation(sessionKey);
+      const orchBinding = getOrchestratedBinding(sessionKey);
+      if (delegation || orchBinding) {
+        logger.info?.(`planning: blocked subagent chain — session ${sessionKey.slice(-8)} is already a subagent`);
+        return {
+          block: true,
+          blockReason:
+            "You are a sub-agent. Do not spawn further sub-agents — do the work directly yourself. " +
+            "If the task is too large, break it into steps and execute them sequentially.",
+        };
+      }
 
       const hasActive = getSessionActivePlan(sessionKey);
       if (hasActive) return; // Plan exists — allow spawn
@@ -772,6 +975,15 @@ const plugin = {
       const toolName: string = event?.toolName ?? ctx?.toolName ?? "";
       recordToolCall(sessionKey, toolName);
       recordTurnToolCall(sessionKey, toolName);
+      // Reset close-nudge counter when agent calls plan_write (responded to nudge)
+      if (toolName === "plan_write") {
+        resetPlanCloseNudges(sessionKey);
+      }
+      // Live metrics: tool finished → show completed tool name with ✓
+      const binding = getOrchestratedBinding(sessionKey);
+      if (binding) {
+        recordToolEnd(sessionKey, toolName);
+      }
     });
 
     // ── subagent_ended Hook ──────────────────────────────────────────────────
@@ -791,6 +1003,13 @@ const plugin = {
       if (binding) {
         const newStatus = outcome === "ok" ? "completed" as const : "failed" as const;
         setManagedStatus(binding.parentSessionKey, binding.planTitle, binding.itemId, newStatus);
+        // Clean up live metrics and binding for this subagent
+        clearMetrics(subagentKey);
+        deleteOrchestratedBinding(subagentKey);
+        // Unregister card refresh if no more in_progress items for this specific plan
+        if (!hasActiveMetricsForPlan(binding.parentSessionKey, binding.planTitle)) {
+          unregisterCardRefreshTarget(binding.parentSessionKey, binding.planTitle);
+        }
         logger.info?.(
           `planning: orchestrated item "${binding.itemId}" in "${binding.planTitle}" → ${newStatus} ` +
           `(subagent ${subagentKey.slice(-8)}, outcome=${outcome})`
@@ -815,6 +1034,9 @@ const plugin = {
       }
 
       // ── Non-orchestrated fallback poke (existing behavior) ─────────────
+      // Clean up delegation state regardless of outcome
+      deletePlanDelegation(subagentKey);
+
       if (outcome === "ok") return; // Announce will handle it
 
       const planDir = getPlanDir(parentKey);
@@ -895,6 +1117,8 @@ const plugin = {
             });
             // Auto-mark item as in_progress
             setManagedStatus(parentSessionKey, plan.title, matchedItem.id, "in_progress");
+            // Start live metrics tracking for this subagent
+            startMetricsTracking(childSessionKey);
             logger.info?.(
               `planning: orchestrated bind ${childSessionKey.slice(-8)} → ` +
               `item "${matchedItem.id}" in "${plan.title}" (parent ${parentSessionKey.slice(-8)})`
@@ -903,11 +1127,68 @@ const plugin = {
             return;
           }
         }
-        // Label was provided but didn't match any orchestrated item
+        // Label didn't match any orchestrated item — fall through to auto-bind.
+        // Agents almost always write labels (just not in item-ID format),
+        // so skipping auto-bind here would disable it entirely in practice.
         logger.info?.(
-          `planning: spawn label "${label}" did not match any orchestrated item — falling through to delegation`
+          `planning: spawn label "${rawLabel}" did not match any orchestrated item — trying auto-bind`
         );
       }
+
+      {
+      // ── Auto-bind: match spawn to plan item ─────────────────────────────
+      // Priority 1: use recently-activated items queue (plan_write set item to in_progress)
+      // Priority 2: find first unbound pending/in_progress item in plan order
+      let bindPlanTitle: string | undefined;
+      let bindItemId: string | undefined;
+
+      const activated = popActivatedItem(parentSessionKey);
+      if (activated) {
+        const plan = parentPlans.find((p) => p.title === activated.planTitle);
+        const item = plan?.items.find((i) => i.id === activated.itemId);
+        const status = item ? (getManagedStatus(parentSessionKey, activated.planTitle, activated.itemId) ?? item.status) : undefined;
+        if (status === "in_progress" || status === "pending") {
+          bindPlanTitle = activated.planTitle;
+          bindItemId = activated.itemId;
+        }
+      }
+
+      // Fallback: find first unbound non-terminal item in plan order
+      if (!bindItemId) {
+        const boundItemIds = new Set<string>();
+        for (const [, b] of getOrchestratedBindingsForParent(parentSessionKey)) {
+          boundItemIds.add(`${b.planTitle}:${b.itemId}`);
+        }
+        for (const plan of parentPlans) {
+          if (!isPlanActive(plan)) continue;
+          for (const item of plan.items) {
+            if (item.status === "completed" || item.status === "cancelled" || item.status === "failed") continue;
+            const managed = getManagedStatus(parentSessionKey, plan.title, item.id);
+            if (managed === "completed" || managed === "failed" || managed === "cancelled") continue;
+            if (managed === "in_progress" && boundItemIds.has(`${plan.title}:${item.id}`)) continue; // already has a subagent
+            bindPlanTitle = plan.title;
+            bindItemId = item.id;
+            break;
+          }
+          if (bindItemId) break;
+        }
+      }
+
+      if (bindPlanTitle && bindItemId) {
+        setOrchestratedBinding(childSessionKey, {
+          parentSessionKey,
+          planTitle: bindPlanTitle,
+          itemId: bindItemId,
+        });
+        setManagedStatus(parentSessionKey, bindPlanTitle, bindItemId, "in_progress");
+        startMetricsTracking(childSessionKey);
+        logger.info?.(
+          `planning: auto-bind ${childSessionKey.slice(-8)} → ` +
+          `item "${bindItemId}" in "${bindPlanTitle}" (parent ${parentSessionKey.slice(-8)})`
+        );
+        return; // Skip delegation — bound subagents don't write to parent plan
+      }
+      } // close auto-bind block
 
       // ── Non-orchestrated: establish plan delegation (existing behavior) ──
       const parentConvId =
@@ -1050,6 +1331,142 @@ const plugin = {
       const finishedTurn = finishTurn(sessionKey);
       if (!finishedTurn) return;
 
+      // ── Plan abandonment guard ─────────────────────────────────────────
+      // If the agent ends its turn while an active plan has incomplete items
+      // and no subagents are currently running, force it to continue.
+      // This is a hard code-level enforcement that catches models (esp. GPT)
+      // that ignore prompt-level instructions and stop mid-plan.
+      const hasActivePlan = getSessionActivePlan(sessionKey);
+      if (hasActivePlan) {
+        const planDir = getPlanDir(sessionKey);
+        if (planDir) {
+          try {
+            const plans = await readAllPlansFromDir(planDir);
+            // Apply managed statuses (subagent auto-updates) to get real state
+            for (const plan of plans) {
+              for (const item of plan.items) {
+                const managed = getManagedStatus(sessionKey, plan.title, item.id);
+                if (managed) item.status = managed;
+              }
+            }
+            // Check for completed-but-not-closed plans: all items are done
+            // (via managedStatus overlay applied above) but the plan still has items
+            // — the agent never called plan_write to sync final status to disk.
+            const completedButNotClosed = plans.filter((p) => {
+              if (p.items.length === 0) return false; // already cleared
+              return p.items.every((i) => i.status === "completed" || i.status === "cancelled" || i.status === "failed");
+            });
+            if (completedButNotClosed.length > 0) {
+              const nudgeCount = getPlanCloseNudges(sessionKey);
+              if (nudgeCount < PLAN_CLOSE_MAX_NUDGES) {
+                const enqueue = (api as any).runtime?.system?.enqueueSystemEvent?.bind(
+                  (api as any).runtime?.system,
+                );
+                if (enqueue) {
+                  const titles = completedButNotClosed.map((p) => `"${p.title}"`).join(", ");
+                  enqueue(
+                    `[planning] Your plan ${titles} is fully completed but you haven't synced the final status. ` +
+                    `Call plan_write now with all items marked completed to close the plan and update the user's progress card.`,
+                    { sessionKey },
+                  );
+                  incrementPlanCloseNudges(sessionKey);
+                  logger.info?.(
+                    `planning: completed-but-not-closed nudge (${nudgeCount + 1}/${PLAN_CLOSE_MAX_NUDGES}) for ${titles} (session ${sessionKey.slice(-8)})`,
+                  );
+                  return;
+                }
+              } else {
+                // Give up nudging — reset counter for future plans
+                resetPlanCloseNudges(sessionKey);
+              }
+            }
+
+            const activePlans = plans.filter((p) => isPlanActive(p));
+            if (activePlans.length > 0) {
+              // If agent asked a blocking question this turn, it's legitimate to stop
+              if (finishedTurn.askedBlockingQuestion) {
+                resetPlanAbandonmentRepokes(sessionKey);
+              } else {
+              // Collect completed IDs for dependency checking
+              const completedIds = new Set(
+                activePlans.flatMap((p) =>
+                  p.items.filter((i) => i.status === "completed").map((i) => i.id),
+                ),
+              );
+              // Collect all items that still need work
+              const pendingItems = activePlans.flatMap((p) =>
+                p.items.filter((i) => i.status === "pending" || i.status === "in_progress"),
+              );
+              // Items the agent genuinely needs to act on:
+              // - Exclude orchestrated items that are in_progress (subagent running)
+              // - Exclude orchestrated pending items whose blockers aren't all completed
+              //   (agent can't dispatch these yet — waiting is correct)
+              const agentOwned = pendingItems.filter((i) => {
+                // Orchestrated + in_progress = subagent handling it
+                if (i.agentTask && i.status === "in_progress") return false;
+                // Orchestrated + pending + has unresolved blockers = can't dispatch yet
+                if (i.agentTask && i.status === "pending" && i.blockedBy?.length) {
+                  const allResolved = i.blockedBy.every((dep) => completedIds.has(dep));
+                  if (!allResolved) return false;
+                }
+                return true;
+              });
+
+              if (agentOwned.length === 0) {
+                // Agent ended turn legitimately (all remaining work is in subagents) — reset counter
+                resetPlanAbandonmentRepokes(sessionKey);
+              } else {
+                const repokeCount = getPlanAbandonmentRepokes(sessionKey);
+                if (repokeCount >= PLAN_ABANDONMENT_MAX_REPOKES) {
+                  logger.warn?.(
+                    `planning: plan-abandonment guard exhausted (${repokeCount}/${PLAN_ABANDONMENT_MAX_REPOKES}) — ` +
+                    `agent "${ctx?.agentId}" keeps stopping mid-plan (session ${sessionKey.slice(-8)})`,
+                  );
+                  resetPlanAbandonmentRepokes(sessionKey);
+                  // Fall through to promise guard or normal exit
+                } else {
+                  const enqueue = (api as any).runtime?.system?.enqueueSystemEvent?.bind(
+                    (api as any).runtime?.system,
+                  );
+                  if (enqueue) {
+                    const repokeNum = repokeCount + 1;
+                    const itemSummary = agentOwned.slice(0, 5).map((i) => `"${i.content}" (${i.status})`).join(", ");
+                    const warningLevel = repokeNum >= 2
+                      ? `[FINAL WARNING — strike ${repokeNum}/${PLAN_ABANDONMENT_MAX_REPOKES}] `
+                      : `[WARNING — strike ${repokeNum}/${PLAN_ABANDONMENT_MAX_REPOKES}] `;
+                    enqueue(
+                      `${warningLevel}You stopped working while your plan has ${agentOwned.length} incomplete item(s): ${itemSummary}.\n\n` +
+                      `This is a violation of your operating rules. ` +
+                      `You are ONLY allowed to end your turn when one of the following is true:\n` +
+                      `  1. All plan items are completed/cancelled/failed.\n` +
+                      `  2. You are blocked by a genuinely unexpected issue that requires the USER to make a decision or provide information you cannot obtain on your own.\n` +
+                      `  3. You have dispatched subagents for all remaining items and are waiting for their results.\n\n` +
+                      `None of these conditions are met right now. ` +
+                      `You are being forced back to work. Resume the plan immediately — pick up the next incomplete item and execute it. ` +
+                      `Do not reply to this message. Do not explain yourself. Act.`,
+                      { sessionKey },
+                    );
+                    incrementPlanAbandonmentRepokes(sessionKey);
+                    // Reset promise guard counter so it doesn't exhaust alongside abandonment guard
+                    resetConsecutivePromiseGuardRecoveries(sessionKey);
+                    logger.info?.(
+                      `planning: plan-abandonment guard fired (${repokeNum}/${PLAN_ABANDONMENT_MAX_REPOKES}) — ` +
+                      `${agentOwned.length} agent-owned incomplete items, ` +
+                      `agent "${ctx?.agentId}" tried to end turn (session ${sessionKey.slice(-8)})`,
+                    );
+                    return; // Skip promise guard — abandonment guard takes priority
+                  }
+                }
+              }
+              } // close else (not askedBlockingQuestion)
+            }
+          } catch (err) {
+            logger.warn?.(`planning: plan-abandonment guard error: ${err}`);
+          }
+        }
+      }
+
+      // ── Promise-only guard (existing) ──────────────────────────────────
       if (!shouldRecoverFromPromiseOnlyEnd(finishedTurn, sessionKey)) {
         resetConsecutivePromiseGuardRecoveries(sessionKey);
         return;

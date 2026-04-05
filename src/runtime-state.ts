@@ -25,6 +25,10 @@ interface SessionState {
   consecutivePromiseGuardRecoveries?: number;
   /** Monotonic per-session turn counter. */
   turnSeqCounter?: number;
+  /** Consecutive plan-abandonment repokes in a row. Reset when agent makes progress. */
+  planAbandonmentRepokes?: number;
+  /** Consecutive completed-but-not-closed nudges. */
+  planCloseNudges?: number;
 }
 
 export type TurnPromptKind =
@@ -187,6 +191,36 @@ export function resetConsecutivePromiseGuardRecoveries(sessionKey: string): void
   getOrCreate(sessionKey).consecutivePromiseGuardRecoveries = 0;
 }
 
+// ── Plan abandonment repoke counter ──
+export function getPlanAbandonmentRepokes(sessionKey: string): number {
+  return sessions.get(sessionKey)?.planAbandonmentRepokes ?? 0;
+}
+
+export function incrementPlanAbandonmentRepokes(sessionKey: string): number {
+  const s = getOrCreate(sessionKey);
+  s.planAbandonmentRepokes = (s.planAbandonmentRepokes ?? 0) + 1;
+  return s.planAbandonmentRepokes;
+}
+
+export function resetPlanAbandonmentRepokes(sessionKey: string): void {
+  getOrCreate(sessionKey).planAbandonmentRepokes = 0;
+}
+
+// ── Plan close nudge counter ──
+export function getPlanCloseNudges(sessionKey: string): number {
+  return sessions.get(sessionKey)?.planCloseNudges ?? 0;
+}
+
+export function incrementPlanCloseNudges(sessionKey: string): number {
+  const s = getOrCreate(sessionKey);
+  s.planCloseNudges = (s.planCloseNudges ?? 0) + 1;
+  return s.planCloseNudges;
+}
+
+export function resetPlanCloseNudges(sessionKey: string): void {
+  getOrCreate(sessionKey).planCloseNudges = 0;
+}
+
 // ── Per-session agentDir (set by plan_write tool, read by before_prompt_build) ──
 
 export function setSessionAgentDir(sessionKey: string, agentDir: string): void {
@@ -271,6 +305,75 @@ export function getPlanDelegation(childSessionKey: string): PlanDelegation | und
   return planDelegations.get(childSessionKey);
 }
 
+export function deletePlanDelegation(childSessionKey: string): void {
+  planDelegations.delete(childSessionKey);
+}
+
+// ── Plan confirmation gate ──
+// Tracks which plan titles have been through the confirmation gate.
+// First plan_write for a new title is blocked so agent confirms with user.
+// After the agent confirms (sends a message), the next plan_write is allowed.
+const confirmedPlanTitles = new Map<string, Set<string>>(); // sessionKey → Set<planTitle>
+
+export function isPlanTitleConfirmed(sessionKey: string, planTitle: string): boolean {
+  return confirmedPlanTitles.get(sessionKey)?.has(planTitle) ?? false;
+}
+
+export function markPlanTitleConfirmed(sessionKey: string, planTitle: string): void {
+  let titles = confirmedPlanTitles.get(sessionKey);
+  if (!titles) {
+    titles = new Set();
+    confirmedPlanTitles.set(sessionKey, titles);
+  }
+  titles.add(planTitle);
+}
+
+// ── Recently activated items queue (for auto-binding spawns to items) ──
+// When plan_write transitions an item from pending → in_progress,
+// the item is pushed here. subagent_spawned pops from this queue
+// to auto-bind the spawn to the correct plan item — no label needed.
+
+interface ActivatedItem {
+  planTitle: string;
+  itemId: string;
+  activatedAt: number;
+}
+
+const recentlyActivatedItems = new Map<string, ActivatedItem[]>(); // keyed by sessionKey
+
+export function pushActivatedItem(sessionKey: string, planTitle: string, itemId: string): void {
+  const queue = recentlyActivatedItems.get(sessionKey) ?? [];
+  queue.push({ planTitle, itemId, activatedAt: Date.now() });
+  recentlyActivatedItems.set(sessionKey, queue);
+}
+
+const ACTIVATED_ITEM_TTL_MS = 30_000; // 30 seconds
+
+export function popActivatedItem(sessionKey: string): ActivatedItem | undefined {
+  const queue = recentlyActivatedItems.get(sessionKey);
+  if (!queue || queue.length === 0) return undefined;
+  // Discard expired items from the front of the queue
+  const now = Date.now();
+  while (queue.length > 0 && now - queue[0].activatedAt > ACTIVATED_ITEM_TTL_MS) {
+    queue.shift();
+  }
+  if (queue.length === 0) {
+    recentlyActivatedItems.delete(sessionKey);
+    return undefined;
+  }
+  const item = queue.shift()!;
+  if (queue.length === 0) recentlyActivatedItems.delete(sessionKey);
+  return item;
+}
+
+export function peekActivatedItems(sessionKey: string): readonly ActivatedItem[] {
+  return recentlyActivatedItems.get(sessionKey) ?? [];
+}
+
+export function clearActivatedItems(sessionKey: string): void {
+  recentlyActivatedItems.delete(sessionKey);
+}
+
 // ── Orchestrated execution state ──
 // Tracks the mapping between subagent child sessions and plan items,
 // plus plugin-managed item statuses that override agent-provided statuses.
@@ -290,6 +393,21 @@ export function setOrchestratedBinding(childSessionKey: string, binding: Orchest
 
 export function getOrchestratedBinding(childSessionKey: string): OrchestratedItemBinding | undefined {
   return orchestratedBindings.get(childSessionKey);
+}
+
+export function deleteOrchestratedBinding(childSessionKey: string): void {
+  orchestratedBindings.delete(childSessionKey);
+}
+
+/** Return all bindings for a given parent session (for live metrics aggregation). */
+export function getOrchestratedBindingsForParent(parentSessionKey: string): Map<string, OrchestratedItemBinding> {
+  const result = new Map<string, OrchestratedItemBinding>();
+  for (const [childKey, binding] of orchestratedBindings) {
+    if (binding.parentSessionKey === parentSessionKey) {
+      result.set(childKey, binding);
+    }
+  }
+  return result;
 }
 
 /**

@@ -54,16 +54,29 @@ export const PlanWriteSchema = Type.Object({
   ),
 });
 
-export const PLAN_WRITE_DESCRIPTION = `Write or update the current task plan. Creates a structured plan for tracking multi-step work.
+export const PLAN_WRITE_DESCRIPTION = `Write or update the current task plan. Creates a structured, user-visible progress card for tracking work that warrants one.
 
-When to use:
-- Any multi-step task, including purely linear flows (read → analyze → output) — a plan keeps you on track through compaction and gives the user real-time visibility. Don't skip it because a task feels simple.
-- Tasks with ≥3 distinct phases or branching decisions
-- ALWAYS before spawning sub-agents (sessions_spawn will be BLOCKED if no plan exists). Write the full plan first — break the task into items covering all phases, then spawn. For non-orchestrated spawns, the sub-agent will see and update your plan automatically via delegation. For orchestrated items (with agentTask), the plugin manages status updates — the sub-agent focuses solely on its task
+A plan is expensive: it creates a progress card in the user's chat, triggers a confirmation round, enters coordinator mode (main agent can only plan/spawn/read/communicate), and adds context overhead every turn. It earns that cost only when the task actually needs it.
 
-When NOT to use:
-- Tasks completable in 1-3 tool calls
-- Quick questions or casual conversation
+When TO use — create a plan if EITHER applies:
+
+1. **User visibility**: The user would wait long enough without feedback that they'd start wondering what you're doing. Investigations, multi-phase builds, long-running work, anything where the user would naturally expect a status window. The plan is their view into progress.
+
+2. **Agent context pressure**: The task involves enough heavy tool output (many file reads, large fetches, deep exploration, parallel branches) that doing it all in one context would crowd out your working memory or risk compaction loss. A plan lets you delegate items to subagents, which keeps their tool outputs isolated from your main context.
+
+If neither is true, DO NOT call plan_write.
+
+When NOT to use — just reply or act directly for any of these:
+
+- **Direct questions**: "what's in this file", "when did X happen", "does function Y exist", "is this configured correctly" — answerable with a handful of tool calls and a reply. The user is waiting for an answer, not a deliverable.
+- **Single-edit changes**: rename a variable, add one line, fix a typo, adjust one config value.
+- **Quick status checks**: peek at a log, check a service, read a file, look up a fact.
+- **Casual conversation & clarifications**: greetings, acknowledgments, short back-and-forth, "yes do that", "no the other one".
+- **Anything finishable this turn**: if you can reasonably imagine ending this turn with a direct reply (even one that includes 3-5 tool calls), skip the plan. A plan that opens and closes in the same turn is pure overhead — the user sees a card flash by for a 5-second answer, and you've spent confirmation-gate and coordinator-mode cost for nothing.
+
+Rule of thumb — ask yourself: "Would the user expect a progress card to appear for this request, or are they waiting for a direct reply?" If the answer is "direct reply", do not plan.
+
+Note: sessions_spawn is BLOCKED without a plan — but this is because spawning is itself a heavy mechanism, not because planning is the default. If you don't need to spawn, you probably don't need a plan.
 
 Before creating the plan:
 - If the task has ambiguities that would block execution, ask ALL clarifying questions upfront in a single message — do this BEFORE writing the plan
@@ -80,8 +93,8 @@ Writing good items:
 
 Best practices:
 - Create a plan at the START of complex work, before doing anything else
-- Update status as you complete each step (mark in_progress → completed)
-- Only one item should be in_progress at a time (unless using orchestrated execution with parallel subagents)
+- For each item: set it to in_progress via plan_write, then spawn a sub-agent (sessions_spawn) to execute it. Write a detailed task prompt for the sub-agent — it has no conversation history, so include all necessary context, file paths, and success criteria.
+- Spawn multiple items in parallel when they have no dependencies between them. Set all of them to in_progress in one plan_write call, then spawn them all in the same turn.
 - Item IDs are auto-assigned — you can omit the \`id\` field. On updates, items are matched by content to preserve their IDs. You can also provide explicit IDs if you prefer.
 - For \`blockedBy\`, use either item IDs (strings) or 0-based array indices (numbers) to reference other items in the same call. Indices are resolved to IDs automatically.
 - Pass the COMPLETE items array every time (full replacement, not incremental)
@@ -98,12 +111,7 @@ Multiple concurrent plans:
 Clearing a plan:
 - Pass an empty items array with the plan's title to clear that specific plan
 
-Orchestrated execution (subagent-per-item):
-- For items that should be executed by subagents, provide an \`agentTask\` field with a self-contained prompt. The subagent has no conversation history — include ALL necessary context: file paths, expected formats, success criteria.
+Dependencies:
 - Declare dependencies with \`blockedBy\` — use 0-based array indices (e.g. \`blockedBy: [0, 1]\` means "wait for the 1st and 2nd items") or item IDs if you provided them explicitly.
-- Items without \`agentTask\` are executed by you directly.
-- Each agentTask should be completable in under 2 minutes by a focused subagent. If a step would take longer, split it into smaller items.
-- Write agentTask like a briefing for a colleague who just joined: goal, context, specific actions, success criteria.
-- After creating the plan, dispatch subagents for all unblocked items. Use sessions_spawn with \`label\` set to the item ID (shown in the orchestration_directive) so the system can track which subagent handles which item.
-- Spawn multiple unblocked items in a single turn for parallel execution.
-- When a subagent completes, the item is automatically marked completed and you will be prompted to dispatch newly unblocked items.`;
+- Items without blockers can be spawned immediately and in parallel.
+- When a sub-agent completes, the item is automatically marked completed and you will be prompted to dispatch newly unblocked items.`;

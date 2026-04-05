@@ -2,7 +2,8 @@
  * Planning Plugin - System Prompt Injection & Card Rendering
  */
 
-import type { PlanFile, PlanStatus } from "./types.js";
+import type { PlanFile, PlanItem, PlanStatus } from "./types.js";
+import type { LiveItemMetrics } from "./live-metrics.js";
 
 // ─── Status Visual Config ────────────────────────────────────────────────────
 
@@ -78,8 +79,7 @@ export function buildPlanReminder(plans: PlanFile[], stale = false): string {
 
   return `<plan_reminder>
 ${header}${body}${staleWarning}
-Update plan_write when you complete a step or the plan changes.
-Mark items in_progress when starting, completed when done.
+For each pending item: set it to in_progress via plan_write, then spawn a sub-agent (sessions_spawn) to execute it. You coordinate; sub-agents do the work. Spawn multiple items in parallel when they have no dependencies.
 Execute autonomously — do not stop to ask "shall I proceed?" or "is this okay?". Only pause for genuinely unexpected blockers requiring a real decision.
 </plan_reminder>`;
 }
@@ -114,9 +114,22 @@ Use plan_write to update status as you work.${hint}
  */
 export function buildPlanAvailable(): string {
   return `<plan_available>
-plan_write is available. Use it before any multi-step work — even linear tasks. A plan keeps you on track across tool calls and context compaction, and shows the user what's happening instead of leaving them waiting blind.
-Multiple concurrent plans are supported — use different titles for unrelated tasks arriving mid-work.
-Workflow: ask all clarifying questions upfront (before the plan), then execute the plan autonomously without stopping to confirm each step.
+plan_write is available for work that genuinely benefits from a tracked, user-visible progress card.
+
+Create a plan when EITHER is true:
+- The user would wait long enough without visibility that they'd start wondering what you're doing (investigations, multi-phase builds, long-running work). A plan is their status window.
+- The work involves enough heavy tool output (big file reads, many fetches, deep exploration) that it should be delegated to subagents to keep your main context clean. A plan is the coordination structure.
+
+Do NOT create a plan for these — just reply or act directly:
+- Direct questions answerable from a single lookup or a handful of tool calls
+- Single-edit changes (rename, add a line, fix a typo)
+- Quick status checks, file peeks, config reads
+- Short casual exchanges, acknowledgments, clarifications
+- Anything where the user is waiting for an answer, not a deliverable
+
+Rule of thumb: if you can reasonably finish this turn with a direct reply, DO NOT call plan_write. A plan that closes in the same turn it was opened is pure noise for the user — a card, a confirmation round, coordinator overhead, all for a 5-second answer.
+
+Multiple concurrent plans are supported — use different titles for unrelated long-running tasks arriving mid-work.
 </plan_available>`;
 }
 
@@ -132,10 +145,9 @@ export function buildDelegatedPlanReminder(plans: PlanFile[], stale = false): st
     : "";
 
   return `<plan_reminder>
-You are a sub-agent. The parent task has active plans — update them using plan_write with the EXACT same title.
+You are a sub-agent executing a specific task from the parent's plan. Do NOT call plan_write — the coordinator manages all plan updates. Focus on completing your assigned task.
 
-${sections}${staleWarning}
-Mark items in_progress when starting, completed when done.
+${sections}
 Execute autonomously — do not stop to ask "shall I proceed?".
 </plan_reminder>`;
 }
@@ -143,9 +155,11 @@ Execute autonomously — do not stop to ask "shall I proceed?".
 // ─── Static Follow-Through Rules (injected into system prompt via appendSystemContext) ──
 
 export const FOLLOW_THROUGH_RULES = `<planning_rules>
-You are an agent that acts, not one that acknowledges. When a user asks you to do something, do it — don't say you will. If you need multiple steps, call plan_write to create a tracked plan before responding. If you genuinely cannot act (missing capability, ambiguous requirements, need credentials), say so plainly instead of making a promise you cannot keep.
+You are an agent that acts, not one that acknowledges. When a user asks you to do something, do it — don't say you will. For simple requests (a lookup, a single edit, a direct question), reply with the answer in this turn. For genuinely multi-phase work the user would want to track, create a plan first (see plan_write criteria). If you cannot act because the request is ambiguous or you lack a capability, say so plainly instead of promising.
 
-Every commitment you make must be backed by either a tool call or a plan_write item in the same turn. A response that contains a commitment but no action — "收到，我去改" / "got it, I'll handle it" / "放心，记着呢" — is not an acceptable output, because there is nothing ensuring follow-through once this turn ends. Either act now, or create a plan item so it becomes tracked.
+Every commitment you make must be backed by either a tool call or (for multi-phase work) a plan_write item in the same turn. A response that contains a commitment but no action — "收到，我去改" / "got it, I'll handle it" / "放心，记着呢" — is not acceptable, because there's nothing ensuring follow-through once this turn ends. Either act now, or create a tracked item.
+
+When you have a plan, execute items by spawning sub-agents (sessions_spawn). Set the item to in_progress, then immediately spawn. Multiple independent items should spawn in parallel in the same turn. The coordinator pattern (plan + spawn) is for work that warrants it — do not put trivial single-step actions into a plan just to have one.
 
 When you claim completion, ground it: what did you change, what command did you run, what output did you see. Never characterize unverified or incomplete work as done.
 </planning_rules>`;
@@ -275,27 +289,7 @@ export function buildOrchestrationDirective(plans: PlanFile[]): string | null {
   return `<orchestration_directive>\n${lines.join("\n")}\n</orchestration_directive>`;
 }
 
-// ─── Feishu Card Rendering (Card DSL format) ─────────────────────────────────
-
-// Bloomberg palette: #F5821F orange for active, grey for done, white for pending
-function formatItemCard(item: { content: string; status: PlanStatus; activeForm?: string }): string {
-  switch (item.status) {
-    case "completed":
-      return `<font color=grey>${STATUS_SYMBOL.completed} ~~${item.content}~~</font>`;
-    case "in_progress": {
-      const suffix = item.activeForm ? ` _— ${item.activeForm}_` : "";
-      return `<font color=#F5821F>${STATUS_SYMBOL.in_progress} **${item.content}**${suffix}</font>`;
-    }
-    case "pending":
-      return `${STATUS_SYMBOL.pending} ${item.content}`;
-    case "cancelled":
-      return `<font color=#8B8000>${STATUS_SYMBOL.cancelled} ~~${item.content}~~</font>`;
-    case "failed":
-      return `<font color=red>${STATUS_SYMBOL.failed} **${item.content}**</font>`;
-    default:
-      return `? ${item.content}`;
-  }
-}
+// ─── Feishu Card Rendering (Card 2.0 — column_set per item) ─────────────────
 
 function headerColor(completed: number, total: number): string {
   if (total === 0 || completed === 0) return "grey";
@@ -303,13 +297,112 @@ function headerColor(completed: number, total: number): string {
   return "orange";
 }
 
+/** Build the icon markdown for an item based on its status. */
+function itemIconMd(status: PlanStatus): string {
+  switch (status) {
+    case "completed":  return `<font color=grey>${STATUS_SYMBOL.completed}</font>`;
+    case "in_progress": return `<font color=#F5821F>${STATUS_SYMBOL.in_progress}</font>`;
+    case "failed":     return `<font color=red>${STATUS_SYMBOL.failed}</font>`;
+    case "cancelled":  return `<font color=grey>${STATUS_SYMBOL.cancelled}</font>`;
+    default:           return STATUS_SYMBOL.pending;
+  }
+}
+
+/** Build the title markdown for an item. */
+function itemTitleMd(item: PlanItem): string {
+  switch (item.status) {
+    case "completed":
+      return `<font color=grey>~~${item.content}~~</font>`;
+    case "in_progress": {
+      const suffix = item.activeForm ? ` _— ${item.activeForm}_` : "";
+      return `<font color=#F5821F>**${item.content}**${suffix}</font>`;
+    }
+    case "cancelled":
+      return `<font color=grey>~~${item.content}~~</font>`;
+    case "failed":
+      return `<font color=red>**${item.content}**</font>`;
+    default:
+      return item.content;
+  }
+}
+
+/**
+ * Build one or two elements for a plan item.
+ * - Line 1: icon + title (column_set)
+ * - Line 2 (optional): live metrics sub-line or blocked-by hint
+ */
+function buildItemElements(item: PlanItem, metrics?: LiveItemMetrics): Record<string, unknown>[] {
+  const elements: Record<string, unknown>[] = [];
+
+  // Line 1: icon + title
+  elements.push({
+    tag: "column_set",
+    flex_mode: "none",
+    horizontal_spacing: "default",
+    columns: [
+      {
+        tag: "column",
+        width: "auto",
+        vertical_align: "center",
+        elements: [{ tag: "markdown", content: itemIconMd(item.status) }],
+      },
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 1,
+        vertical_align: "center",
+        elements: [{ tag: "markdown", content: itemTitleMd(item) }],
+      },
+    ],
+  });
+
+  // Line 2: live metrics (in_progress with active subagent)
+  if (item.status === "in_progress" && metrics) {
+    elements.push({
+      tag: "column_set",
+      flex_mode: "none",
+      horizontal_spacing: "default",
+      columns: [
+        {
+          tag: "column",
+          width: "weighted",
+          weight: 1,
+          vertical_align: "center",
+          elements: [{ tag: "markdown", content: `<font color=#F5821F>　正在 ${metrics.currentActivity}　已执行 ${metrics.blockCount} 步</font>` }],
+        },
+        {
+          tag: "column",
+          width: "auto",
+          vertical_align: "center",
+          elements: [{ tag: "markdown", content: `<font color=grey>耗时 ${metrics.elapsed}</font>` }],
+        },
+      ],
+    });
+  }
+
+  // Line 2: blocked-by hint (pending with dependencies)
+  if (item.status === "pending" && item.blockedBy && item.blockedBy.length > 0) {
+    elements.push({
+      tag: "div",
+      text: { tag: "lark_md", content: `<font color=grey>　等待 ${item.blockedBy.join(", ")} 完成</font>` },
+    });
+  }
+
+  return elements;
+}
+
 /**
  * Render a Feishu Card 2.0 JSON object.
  *
- * Card 2.0 supports per-column background_style, enabling a real color
- * progress bar. Individual column weights must be integers in [1, 5].
+ * Each plan item is a `column_set` row with status icon, title, and
+ * optional live metrics (elapsed time, block count, current activity)
+ * for in_progress orchestrated items.
  */
-export function renderFeishuCard(plan: PlanFile, message?: string): Record<string, unknown> {
+export function renderFeishuCard(
+  plan: PlanFile,
+  message?: string,
+  liveMetrics?: Map<string, LiveItemMetrics>,
+): Record<string, unknown> {
   const items = plan.items;
   const total = items.length;
   const completed = items.filter((i) => i.status === "completed").length;
@@ -323,25 +416,20 @@ export function renderFeishuCard(plan: PlanFile, message?: string): Record<strin
   });
 
   const noteContent = message ? `${message} · ${time}` : time;
-  const itemsText = items.map(formatItemCard).join("\n");
 
   const bodyElements: Record<string, unknown>[] = [];
 
-  // ── Stacked horizontal barChart as progress bar ──────────────────────────────
+  // ── Progress bar (stacked horizontal chart) ──────────────────────────────
   const emptyPct = 100 - pct;
   bodyElements.push({
     tag: "chart",
     height: "24px",
     chart_spec: {
       type: "bar",
-      data: [
-        {
-          values: [
-            { x: "p", y: pct, t: "done" },
-            { x: "p", y: emptyPct,  t: "todo" },
-          ],
-        },
-      ],
+      data: [{ values: [
+        { x: "p", y: pct, t: "done" },
+        { x: "p", y: emptyPct, t: "todo" },
+      ]}],
       xField: "y",
       yField: "x",
       seriesField: "t",
@@ -367,14 +455,16 @@ export function renderFeishuCard(plan: PlanFile, message?: string): Record<strin
 
   bodyElements.push({ tag: "hr" });
 
-  bodyElements.push({
-    tag: "div",
-    text: { tag: "lark_md", content: itemsText },
-  });
+  // ── Items: each item is a module (title line + optional metrics/blocked sub-line) ──
+  for (const item of items) {
+    const metrics = liveMetrics?.get(item.id);
+    for (const el of buildItemElements(item, metrics)) {
+      bodyElements.push(el);
+    }
+  }
 
   bodyElements.push({ tag: "hr" });
 
-  // `note` is deprecated in Card 2.0 — use a small italic div instead
   bodyElements.push({
     tag: "div",
     text: { tag: "lark_md", content: `_${noteContent}_` },
