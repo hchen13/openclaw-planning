@@ -26,23 +26,29 @@ When an agent creates a plan, a Feishu card appears in the user's chat:
 ● [done] Diagnose price-monitor crash root cause
 ● [done] Fix code and verify stable operation
 ◉ [active] Confirm XAUT price watch resumed — running verification
+   正在 读文件  已执行 8 步                耗时 1.4m
 ○ Confirm Iran news watch resumed
 ```
 
-The card updates in real-time as the agent progresses. One card per plan, PATCHed in place — no message spam.
+In-progress items show a live sub-line underneath the title — current tool activity, block count, and elapsed time, refreshed every second. One card per plan, PATCHed in place — no message spam.
 
 ## Core Capabilities
 
 - **`plan_write` tool** — agents create and update task plans with status tracking (pending → in_progress → completed/cancelled/failed)
-- **Orchestrated execution** — plan items can be dispatched to individual subagents with dependency tracking, parallel execution for independent items, and automatic progress updates
+- **Live subagent metrics** — while an item is in progress, its card shows real-time elapsed time, tool block count, and current tool activity (e.g. "正在 读文件 · 已执行 8 步 · 耗时 1.4m"). The card refreshes every second via Feishu PATCH
+- **Coordinator mode** — when a plan is active, the main agent is restricted to plan/spawn/read/communicate tools. Real work must flow through subagents, guaranteeing every item runs under an isolated subagent with live metrics
+- **Orchestrated execution** — plan items are dispatched to individual subagents with dependency tracking, parallel execution for independent items, and automatic progress updates
+- **Auto-binding** — spawned subagents auto-bind to plan items via an activation queue with plan-order fallback, removing the need for the agent to supply explicit item labels
 - **Dependency management** — items declare dependencies via `blockedBy`; the plugin validates the dependency graph and coordinates dispatch order
 - **Multiple concurrent plans** — unrelated tasks arriving mid-work get separate plans with separate cards, each orchestrated independently
 - **Subagent plan delegation** — for non-orchestrated items, sub-agents automatically update the parent's plan and card
+- **Plan confirmation gate** — the first `plan_write` for a new plan title is blocked once, forcing the agent to do a Socratic clarification round with the user before committing to scope
 - **Spawn gating** — `sessions_spawn` is blocked until a plan exists, ensuring user visibility before long background operations
 - **System prompt injection** — active plans and follow-through behavioral rules are injected every turn (adaptive: sparse when just updated, full when stale)
 - **Conversation-aware routing** — cards go to the correct chat (group or DM), not always the requester's DM
 - **Confirmation interception** — suppresses "shall I proceed?" when the agent has a plan and should just execute
 - **Promise-only turn guard** — detects and handles messages that only state future intent without action
+- **Plan lifecycle guards** — plan-abandonment strike counter, completed-but-not-closed nudge, and forward-progress acceptance for plugin-managed item statuses
 - **Cancellation support** — agents mark remaining items as `cancelled` when the user stops a task
 
 ## How It Works
@@ -71,24 +77,27 @@ Agent creates plan → spawns sub-agent
 
 ### Orchestrated Execution
 
-When plan items have `agentTask` fields, the plugin enters orchestrated mode:
+In coordinator mode, the main agent delegates all execution to subagents. The plugin ties each spawn to a plan item and auto-updates statuses:
 
 ```
-Agent creates plan with agentTask + blockedBy
+Agent creates plan → marks item(s) in_progress
   → plugin injects <orchestration_directive> showing ready items
-  → agent spawns one subagent per ready item (label = item ID)
-  → plugin auto-binds subagent to item, marks in_progress
-  → subagent completes → plugin auto-marks completed
-  → plugin checks for newly unblocked items → injects updated directive
-  → agent dispatches next batch (parallel if independent)
-  → all items done → agent summarizes results
+  → agent spawns subagents (labels optional — auto-binding handles it)
+  → plugin binds each spawn to the next pending item via an activation
+    queue, with fallback to plan order
+  → each subagent runs with live metrics flowing to the card
+  → subagent completes → plugin auto-marks the item completed
+  → plugin checks for newly unblocked items → re-injects the directive
+  → agent dispatches the next batch (parallel if independent)
+  → all items done → agent closes the plan and replies
 ```
 
-Key differences from manual mode:
-- Orchestrated subagents do NOT get plan delegation — the plugin manages their status
-- Independent items can run in parallel (agent spawns multiple subagents in one turn)
-- Dependencies are enforced: items with unresolved `blockedBy` cannot be dispatched
+Key behaviors:
+- Main agent in coordinator mode can only plan/spawn/read/communicate — real work is always in subagents
+- Independent items run in parallel (agent spawns multiple subagents in one turn)
+- Dependencies are enforced via `blockedBy`; unresolved items cannot be dispatched
 - Failed dependencies trigger deadlock detection with explicit decision prompts
+- Subagents do NOT call `plan_write` themselves — the coordinator manages all plan state
 
 The agent MUST create a plan before spawning — `sessions_spawn` is blocked otherwise.
 
@@ -98,7 +107,7 @@ Every turn, the plugin injects plan context based on recency:
 
 | State | Injection | Purpose |
 |-------|-----------|---------|
-| No plan | `<plan_available>` | Nudge to create a plan for multi-step work |
+| No plan | `<plan_available>` | Show the criteria for when a plan is warranted (user visibility vs. agent context pressure) |
 | Just updated (idle < 3 turns) | Sparse reminder | Save tokens — agent already has context |
 | Normal (idle 3–7) | Full plan state | Re-anchor the agent on current progress |
 | Stale (idle ≥ 8) | Full + warning | Prompt agent to update before it drifts |
@@ -115,12 +124,20 @@ Progress cards are sent to the conversation where the request originated:
 
 If you're an AI agent with `plan_write` available, here's what you need to know:
 
-**When to create a plan:**
-- Any task with 3+ distinct steps — even purely linear ones (read → analyze → write). A plan keeps you anchored through context compaction and shows the user you're making progress.
-- ALWAYS before spawning sub-agents. The spawn will be **blocked** if you don't have a plan. Break down the full task first, then spawn.
+**When to create a plan (create if EITHER applies):**
+- **User visibility**: the user would wait long enough without feedback that they'd start wondering what you're doing. Multi-phase work, investigations, long-running tasks — anything where a progress card in their chat would answer "what's happening right now?"
+- **Agent context pressure**: the task involves enough heavy tool output (big file reads, many fetches, deep exploration) that delegating items to subagents is meaningfully valuable to keep your main context clean
+
+Plans also gate `sessions_spawn` — you cannot spawn subagents without a plan. By design: if you need to spawn, you probably need a plan.
 
 **When NOT to create a plan:**
-- Quick answers, single lookups, tasks completable in 1-3 tool calls.
+- Direct questions answerable with a single lookup or a handful of tool calls
+- Single-edit changes (rename a variable, fix a typo, add one line)
+- Quick status checks, file peeks, config reads
+- Short casual exchanges and clarifications
+- Anything you can reasonably finish this turn with a direct reply
+
+Rule of thumb: ask yourself "would the user expect a progress card for this request, or are they waiting for a direct reply?" If the answer is "direct reply", do not plan. A plan that opens and closes in the same turn is pure overhead — card, confirmation gate, coordinator mode, all for a 5-second answer.
 
 **How to use plan_write effectively:**
 - Create the plan at the START, before doing any work.
@@ -213,6 +230,7 @@ src/
 ├── plan-state.ts         # Disk I/O: atomic read/write, DAG validation
 ├── plan-injection.ts     # Prompt injection (plan reminders, orchestration directive, follow-through rules, card rendering)
 ├── runtime-state.ts      # In-memory session state: turns, idle counters, delegation, orchestration bindings, managed statuses
+├── live-metrics.ts       # Per-subagent live metrics (elapsed, tool count, current activity) + 1s card refresh loop
 ├── feishu-client.ts      # Feishu REST client (send/update cards, token cache)
 └── telegram-client.ts    # Telegram Bot API client (send/edit messages)
 ```
@@ -231,7 +249,6 @@ Plan files are stored per-agent, per-session, per-plan:
 - **Promise-only recovery is best-effort** — when guarded modes suppress a promise-only update, the plugin can repoke the same session once, but that path also depends on the same private runtime API
 - **ConversationId fallback** — card routing to group chats depends on `conversationId` in the `message_received` hook; falls back to requester DM if unavailable
 - **Gateway restart during orchestration** — if the gateway restarts while orchestrated subagents are running, progress tracking may be lost; items may need to be re-dispatched manually
-- **Progress card lags in orchestrated mode** — the Feishu/Telegram card only updates when `plan_write` is called; the orchestration directive in the agent's prompt reflects true status immediately
 
 ## Requirements
 
