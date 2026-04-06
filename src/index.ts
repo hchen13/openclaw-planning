@@ -852,10 +852,13 @@ const plugin = {
       // plan to the user and confirm scope before creating it. This prevents
       // plans that are off-target — especially important for weaker models (GPT).
       // Skip for subagents (delegated or bound) — they execute, not plan.
+      // Skip for cron jobs — no human present to confirm, and the task is already
+      // defined by the cron trigger prompt. Blocking just wastes a turn.
       if (toolName === "plan_write" && sessionKey) {
         const hasDelegation = !!getPlanDelegation(sessionKey);
         const hasBound = !!getOrchestratedBinding(sessionKey);
-        if (!hasDelegation && !hasBound) {
+        const isCron = sessionKey.includes(":cron:");
+        if (!hasDelegation && !hasBound && !isCron) {
           const params = event?.params ?? event?.args ?? {};
           const title: string = params.title ?? "";
           const items: unknown[] = params.items ?? [];
